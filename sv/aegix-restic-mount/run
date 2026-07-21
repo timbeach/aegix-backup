@@ -1,0 +1,11 @@
+#!/bin/sh
+# aegix-restic-mount: unlock + mount the always-present internal LUKS restic disk at boot.
+# This system's runit setup does NOT process /etc/crypttab, so we do the secondary-disk unlock the
+# same runit-native way as the external's boot one-shot: NO `down` file, so runsvdir starts it once
+# at boot (after supervision is up), it unlocks sda with LOCAL_KEYFILE + mounts it at LOCAL_MNT,
+# then downs itself so runsv doesn't restart it. Safe/no-op if the disk isn't present.
+exec 2>&1
+sleep 5                                    # let block devices settle after boot
+/usr/local/sbin/aegix-backup local-up || true
+sv d aegix-restic-mount                    # done for this boot; do not restart
+exec sleep 1

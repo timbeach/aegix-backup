@@ -1,0 +1,13 @@
+#!/bin/sh
+# aegix-automount-boot: covers the "drive was already plugged in when the machine booted" case.
+#
+# The hotplug path (udev rule -> `sv once aegix-automount`) does NOT fire on boot: udev's coldplug
+# pass replays the drive's `add` event before runsvdir is supervising our service, so the poke
+# no-ops. This service runs ONCE per boot, after runit supervision is up, and calls the same
+# idempotent automount-sync used by hotplug. If the drive is absent it just no-ops (inherently
+# "nofail"); if present it gets the read-only browse mount at AUTOMOUNT_MNT.
+exec 2>&1
+sleep 5                                    # let block devices + the LUKS mapper settle after boot
+/usr/local/sbin/aegix-backup automount-sync || true
+sv d aegix-automount-boot                  # done for this boot; do not let runsv restart us
+exec sleep 1

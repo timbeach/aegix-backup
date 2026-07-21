@@ -1,0 +1,695 @@
+#!/usr/bin/env bash
+# aegix-backup — config-driven encrypted 3-2-1 backup for Aegix Linux.
+set -uo pipefail
+CONF=${AEGIX_BACKUP_CONF:-/etc/aegix-backup.conf}
+DRYRUN=0
+
+# ---- load config ----
+[ -r "$CONF" ] || { echo "FATAL: missing config $CONF"; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+mkdir -p "$LOG_DIR"
+# The config's SRC_LUKS names the mapper of the NORMAL system, but this tool has to work during an
+# actual recovery — i.e. when you have booted a CLONE and want to rebuild onto a replacement drive.
+# In that situation the configured mapper does not exist at all and every clone would fail at
+# snapshot time. Always snapshot whatever system is really running: derive the source from the
+# running root, keeping the configured value only as a fallback.
+_running_root_dev(){ findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*\]$//'; }
+_rr=$(_running_root_dev)
+if [ -n "$_rr" ] && [ -e "$_rr" ] && [ "$_rr" != "${SRC_LUKS:-}" ]; then
+  SRC_LUKS_CONFIGURED="${SRC_LUKS:-}"; SRC_LUKS="$_rr"
+fi
+unset _rr
+
+# PATH for user-context (runuser) calls: pip/pipx tools like `hf` live in ~/.local/bin, which
+# runuser's minimal login env omits. Deterministic PATH so hf/restic/git all resolve.
+USER_PATH="$AB_HOME/.local/bin:/usr/local/bin:/usr/bin"
+# run a command as AB_USER with that PATH
+as_user(){ runuser -u "$AB_USER" -- env PATH="$USER_PATH" "$@"; }
+# run restic as AB_USER with the repo password file wired in (DRY: init/backup/forget all use it)
+restic_u(){ runuser -u "$AB_USER" -- env PATH="$USER_PATH" RESTIC_PASSWORD_FILE="$RESTIC_PW_FILE" restic "$@"; }
+
+usage(){ cat <<EOF
+aegix-backup <command>
+  preflight     check prerequisites and config sanity
+  clone-daily | clone-weekly | videos
+  clone-bootfix [target]   re-apply bootability to one/all clone targets (no rsync)
+  clone-browse <target> | clone-unbrowse <target>   read-only look inside a clone
+  ext-snapshot
+  notes-push
+  pictures
+  daily | now   run the scheduled set (now == daily)
+  automount-up | automount-down | automount-sync   (udev/runit; interactive read-only browse mount)
+  local-up      unlock + mount the internal restic disk (runit boot service; keeps it mounted)
+  --dry-run     (prefix) show actions without doing them
+EOF
+}
+
+# ---- utilities ----
+ts(){ date '+%Y-%m-%d %H:%M:%S'; }
+log(){ echo "$(ts) $*" | tee -a "$LOG_DIR/aegix-backup.log"; }
+run(){ if [ "$DRYRUN" = 1 ]; then echo "DRYRUN: $*"; else "$@"; fi; }
+fail(){ log "ERROR: $*"; echo "$(ts) FAIL: $*" > "$STATUS_FILE"; notify "aegix-backup FAILED: $*"; }
+notify(){ runuser -u "$NOTIFY_USER" -- env DISPLAY=:0 notify-send "aegix-backup" "$*" 2>/dev/null || true; }
+
+# Warn (non-fatal) if a gocryptfs PLAINTEXT mount is active. Plaintext never reaches a backup
+# anyway: the clone EXCLUDEs decrypted vault mountpoints, notes track only ciphertext (the
+# plaintext dir is gitignored + guarded via NOTES_PLAINTEXT_DIR), and Pictures go through restic.
+# A blanket refuse would wrongly skip nightly backups whenever the vault is open.
+warn_plaintext(){
+  if mount | grep -qi 'fuse.gocryptfs'; then
+    log "NOTE: gocryptfs plaintext mount active — relying on excludes/gitignore to keep plaintext out of backups"; fi
+}
+
+# Single-instance lock.
+LOCK=/run/aegix-backup.lock
+acquire_lock(){ exec 9>"$LOCK"; flock -n 9 || { echo "another aegix-backup is running"; exit 1; }; }
+
+# ---- prerequisite/sanity check ----
+cmd_preflight(){
+  local ok=1
+  for b in rsync btrfs cryptsetup restic git; do command -v "$b" >/dev/null || { echo "MISSING binary: $b"; ok=0; }; done
+  as_user sh -c 'command -v hf' >/dev/null 2>&1 || { echo "MISSING: hf for $AB_USER (looked on $USER_PATH)"; ok=0; }
+  [ -e "$SRC_LUKS" ] || { echo "MISSING source LUKS $SRC_LUKS"; ok=0; }
+  # local restic disk (holds the repo): keyfile must exist and the LUKS device should be present
+  [ -r "$LOCAL_KEYFILE" ] || { echo "MISSING local restic keyfile $LOCAL_KEYFILE"; ok=0; }
+  local_present || echo "WARN: local restic disk (LOCAL_LUKS_UUID=$LOCAL_LUKS_UUID) not present — pictures will skip"
+  [ -r "$RESTIC_PW_FILE" ] || { echo "MISSING restic password file $RESTIC_PW_FILE"; ok=0; }
+  for v in EXCLUDE_ROOT EXCLUDE_HOME_ALWAYS EXCLUDE_HOME_SEPARATE EXCLUDE_HOME_DAILY_EXTRA; do
+    declare -p "$v" >/dev/null 2>&1 || { echo "MISSING config array: $v (update $CONF from .conf.example)"; ok=0; }
+  done
+  # non-interactive git push?
+  if ! runuser -u "$AB_USER" -- env GIT_TERMINAL_PROMPT=0 git -C "$NOTES_REPO" ls-remote >/dev/null 2>&1; then
+    echo "WARN: '$NOTES_REPO' git remote not reachable non-interactively (notes-push will fail)"; ok=0; fi
+  if [ "$ok" = 1 ]; then echo "preflight OK"; else echo "preflight FAILED"; return 1; fi
+}
+
+# ---- clone target selection ----
+# Each clone target (internal NVMe, external travel drive) is described by TGT_<name>_* config.
+# Selecting one rebinds the EXT_* variables the device helpers already use, so ext_unlock/
+# ext_mount/make_clone_bootable/ext_close all work unchanged against whichever target is active.
+CLONE_TARGET=""
+select_clone_target(){
+  local n="$1" f var
+  for f in LUKS_UUID BOOT_UUID MAPPER KEYFILE; do
+    var="TGT_${n}_${f}"
+    [ -n "${!var:-}" ] || { fail "clone target '$n': missing config $var"; return 1; }
+  done
+  var="TGT_${n}_LUKS_UUID"; EXT_LUKS_UUID="${!var}"
+  var="TGT_${n}_BOOT_UUID"; EXT_BOOT_UUID="${!var}"
+  var="TGT_${n}_MAPPER";    EXT_MAPPER="${!var}"
+  var="TGT_${n}_KEYFILE";   EXT_KEYFILE="${!var}"
+  CLONE_TARGET="$n"
+}
+
+# True when the selected target is the disk the running system booted from. During a real recovery
+# you are booted FROM a clone, and that clone is still listed in CLONE_TARGETS — without this we
+# would rsync the running system onto itself (with --delete) and grub-install over its bootloader.
+target_is_running_system(){
+  local tgt rr rootdisk tgtdisk
+  tgt=$(readlink -f "/dev/disk/by-uuid/$EXT_LUKS_UUID" 2>/dev/null) || return 1
+  [ -n "$tgt" ] || return 1
+  rr=$(_running_root_dev); [ -n "$rr" ] || return 1
+  rootdisk=$(lsblk -rnso NAME "$rr"  2>/dev/null | tail -1)
+  tgtdisk=$(lsblk -rnso NAME "$tgt" 2>/dev/null | tail -1)
+  [ -n "$rootdisk" ] && [ "$rootdisk" = "$tgtdisk" ]
+}
+
+# ---- external device helpers ----
+ext_present(){ [ -e "/dev/disk/by-uuid/$EXT_LUKS_UUID" ]; }
+
+ext_unlock(){
+  # If an interactive read-only auto-mount is holding the drive, release it so the job gets a
+  # clean read-write drive (marker present == the auto-mount opened the mapper). No-op otherwise.
+  # Only ever applies to the removable drive — an internal clone target is never browse-mounted,
+  # and without this check a clone to the internal target would tear down the external's mount.
+  if [ "$EXT_MAPPER" = "${AUTOMOUNT_MAPPER:-$EXT_MAPPER}" ] && [ -e "${AUTOMOUNT_MARKER:-/run/aegix-automount.active}" ]; then
+    automount_down_internal
+  fi
+  [ -e "/dev/mapper/$EXT_MAPPER" ] && return 0
+  if [ "$DRYRUN" != 1 ]; then
+    [ -r "$EXT_KEYFILE" ] || { fail "keyfile $EXT_KEYFILE missing"; return 1; }
+  fi
+  run cryptsetup luksOpen --key-file "$EXT_KEYFILE" "/dev/disk/by-uuid/$EXT_LUKS_UUID" "$EXT_MAPPER"
+}
+
+ext_mount(){
+  local dev="/dev/mapper/$EXT_MAPPER"
+  # flip @/@home rw (received_uuid from the original btrfs send leaves them ro)
+  run mkdir -p "$MNT_DST_TOP"; mountpoint -q "$MNT_DST_TOP" || run mount -o compress=lzo,ssd "$dev" "$MNT_DST_TOP"
+  run btrfs property set -f "$MNT_DST_TOP/$SRC_ROOT" ro false 2>/dev/null || true
+  run btrfs property set -f "$MNT_DST_TOP/$SRC_HOME" ro false 2>/dev/null || true
+  # clone mounts
+  run mkdir -p "$MNT_CLONE"
+  mountpoint -q "$MNT_CLONE"      || run mount -o "compress=lzo,ssd,subvol=$SRC_ROOT" "$dev" "$MNT_CLONE"
+  run mkdir -p "$MNT_CLONE/home" "$MNT_CLONE/boot"
+  mountpoint -q "$MNT_CLONE/home" || run mount -o "compress=lzo,ssd,subvol=$SRC_HOME" "$dev" "$MNT_CLONE/home"
+  mountpoint -q "$MNT_CLONE/boot"  || run mount "/dev/disk/by-uuid/$EXT_BOOT_UUID" "$MNT_CLONE/boot"
+}
+
+ext_close(){
+  run sync
+  run umount -R "$MNT_CLONE" 2>/dev/null || true
+  run umount -R "$MNT_DST_TOP" 2>/dev/null || true
+  run umount "$MNT_SRC_TOP" 2>/dev/null || true
+  [ -e "/dev/mapper/$EXT_MAPPER" ] && run cryptsetup luksClose "$EXT_MAPPER" || true
+}
+
+# ---- local restic disk (always-present internal LUKS SSD that hosts the restic repo) ----
+# This decouples the Pictures offsite from the external DR drive: the nightly restic backup writes
+# to this always-available disk and mirrors ciphertext to HF, so it needs nothing plugged in.
+# Auto-unlocked at boot by the runit service 'aegix-restic-mount' (crypttab isn't processed here).
+# NOTE: unlike the external, this disk is left mounted after a job — it's the permanent repo home.
+local_present(){ [ -n "${LOCAL_LUKS_UUID:-}" ] && [ -e "/dev/disk/by-uuid/$LOCAL_LUKS_UUID" ]; }
+local_unlock(){
+  [ -e "/dev/mapper/$LOCAL_MAPPER" ] && return 0
+  if [ "$DRYRUN" != 1 ]; then
+    [ -r "$LOCAL_KEYFILE" ] || { fail "local repo keyfile $LOCAL_KEYFILE missing"; return 1; }
+  fi
+  run cryptsetup luksOpen --key-file "$LOCAL_KEYFILE" "/dev/disk/by-uuid/$LOCAL_LUKS_UUID" "$LOCAL_MAPPER"
+}
+local_mount(){
+  run mkdir -p "$LOCAL_MNT"
+  mountpoint -q "$LOCAL_MNT" || run mount "/dev/mapper/$LOCAL_MAPPER" "$LOCAL_MNT"
+}
+# unlock + mount the repo disk; no-op (not an error) if the disk isn't present
+local_up(){ local_present || { log "local-up: restic disk not present — skipping"; return 0; }; local_unlock || return 1; local_mount; }
+cmd_local_up(){ local_up && [ -e "/dev/mapper/$LOCAL_MAPPER" ] && log "local-up: restic disk mounted at $LOCAL_MNT" || true; }
+
+# ---- interactive auto-mount (udev + runit one-shot) ----
+# Tear down the read-only browse mount and, if the auto-mount opened the mapper (marker present),
+# close it. Idempotent and safe against a yanked device (lazy umount + dmsetup fallback).
+automount_down_internal(){
+  mountpoint -q "$AUTOMOUNT_MNT/home" && { run umount "$AUTOMOUNT_MNT/home" 2>/dev/null || run umount -l "$AUTOMOUNT_MNT/home"; }
+  mountpoint -q "$AUTOMOUNT_MNT"      && { run umount "$AUTOMOUNT_MNT" 2>/dev/null      || run umount -l "$AUTOMOUNT_MNT"; }
+  if [ -e "$AUTOMOUNT_MARKER" ] && [ -e "/dev/mapper/$EXT_MAPPER" ]; then
+    run cryptsetup luksClose "$EXT_MAPPER" 2>/dev/null || run dmsetup remove "$EXT_MAPPER" 2>/dev/null || true
+  fi
+  run rm -f "$AUTOMOUNT_MARKER"
+}
+
+cmd_automount_up(){
+  [ "${AUTOMOUNT_ENABLE:-0}" = 1 ] || { log "automount-up: disabled in config"; return 0; }
+  ext_present || { log "automount-up: drive not attached"; return 0; }
+  # Never fight a running backup job — it holds the lock for its whole run.
+  exec 9>"$LOCK"
+  if ! flock -n 9; then log "automount-up: backup job running — leaving the drive to it"; return 0; fi
+  # Clear any stale interactive state from a prior (possibly yanked) session.
+  [ -e "$AUTOMOUNT_MARKER" ] && automount_down_internal
+  if [ -e "/dev/mapper/$EXT_MAPPER" ]; then
+    log "automount-up: mapper already open — not touching"; return 0; fi
+  [ -r "$EXT_KEYFILE" ] || { log "automount-up: keyfile $EXT_KEYFILE unreadable — skipping"; return 0; }
+  if ! run cryptsetup luksOpen --key-file "$EXT_KEYFILE" "/dev/disk/by-uuid/$EXT_LUKS_UUID" "$EXT_MAPPER"; then
+    notify "DR drive plugged in, but the keyfile can't unlock it — has 'luksAddKey' been run?"
+    log "automount-up: keyfile did not unlock the drive (keyslot not added?)"; return 0; fi
+  local dev="/dev/mapper/$EXT_MAPPER"
+  run mkdir -p "$AUTOMOUNT_MNT"
+  if ! run mount -o "ro,subvol=$SRC_ROOT" "$dev" "$AUTOMOUNT_MNT"; then
+    run cryptsetup luksClose "$EXT_MAPPER"; fail "automount-up: read-only mount failed"; return 1; fi
+  run mkdir -p "$AUTOMOUNT_MNT/home"
+  run mount -o "ro,subvol=$SRC_HOME" "$dev" "$AUTOMOUNT_MNT/home" 2>/dev/null || true
+  run touch "$AUTOMOUNT_MARKER"
+  log "automount-up: mounted read-only at $AUTOMOUNT_MNT"
+  notify "DR backup drive mounted read-only at $AUTOMOUNT_MNT"
+}
+
+cmd_automount_down(){ automount_down_internal; log "automount-down: cleaned up"; }
+
+# Called by the runit service on any udev add/remove: mount when the drive is present, tidy up when gone.
+cmd_automount_sync(){ if ext_present; then cmd_automount_up; else cmd_automount_down; fi; }
+
+# ---- clone ----
+# fresh consistent read-only source snapshots (replace previous run's)
+mk_src_snapshots(){
+  run mkdir -p "$MNT_SRC_TOP"; mountpoint -q "$MNT_SRC_TOP" || run mount -o subvolid=5 "$SRC_LUKS" "$MNT_SRC_TOP"
+  for s in ab-snap-root ab-snap-home; do [ -d "$MNT_SRC_TOP/$s" ] && run btrfs subvolume delete "$MNT_SRC_TOP/$s"; done
+  run btrfs subvolume snapshot -r "$MNT_SRC_TOP/$SRC_ROOT" "$MNT_SRC_TOP/ab-snap-root"
+  run btrfs subvolume snapshot -r "$MNT_SRC_TOP/$SRC_HOME" "$MNT_SRC_TOP/ab-snap-home"
+}
+
+# fail clearly (not a cryptic set-u "unbound variable" mid-clone) if the config predates the
+# EXCLUDE_* split — e.g. a shared install whose /etc/aegix-backup.conf wasn't updated from the example.
+require_exclude_config(){
+  local v
+  for v in EXCLUDE_ROOT EXCLUDE_HOME_ALWAYS EXCLUDE_HOME_SEPARATE EXCLUDE_HOME_DAILY_EXTRA; do
+    declare -p "$v" >/dev/null 2>&1 || { fail "config $CONF is missing $v — update it from aegix-backup.conf.example"; return 1; }
+  done
+}
+# build --exclude args for the ROOT (@) transfer
+root_exclude_args(){ local e; for e in "${EXCLUDE_ROOT[@]}"; do printf -- '--exclude=%s\n' "$e"; done; }
+# build --exclude args for the HOME (@home) transfer; $1 = daily|weekly
+home_exclude_args(){
+  local -a ex=( "${EXCLUDE_HOME_ALWAYS[@]}" "${EXCLUDE_HOME_SEPARATE[@]}" )
+  [ "$1" = daily ] && ex+=( "${EXCLUDE_HOME_DAILY_EXTRA[@]}" )
+  local e; for e in "${ex[@]}"; do printf -- '--exclude=%s\n' "$e"; done
+}
+
+# rsync that DOESN'T swallow failures. 0 = clean; 23/24 = partial (some files skipped, e.g. the
+# known-corrupt source files) — log a warning but continue; any other code = hard failure.
+do_rsync(){
+  run rsync "$@"; local rc=$?
+  case "$rc" in
+    0) return 0;;
+    23|24) log "clone: rsync completed with warnings (code $rc — some files skipped, e.g. known-corrupt source)"; return 0;;
+    *) fail "clone: rsync failed (exit $rc)"; return "$rc";;
+  esac
+}
+
+# Make the freshly-rsynced clone INDEPENDENTLY BOOTABLE. The three rsyncs above overwrite the
+# clone's /etc (fstab, crypttab, default/grub) and /boot (grub.cfg, initramfs) with the INTERNAL's
+# copies, all of which reference the internal drive's UUIDs. Left like that, the clone boots the
+# internal system (or fails if it's absent) — useless as recovery media. So after every clone we
+# repoint the boot chain at the EXTERNAL's own LUKS/btrfs/boot UUIDs and reinstall GRUB to its MBR.
+# (Folds ~/dr-bootloader-fixup.sh into the tool so it survives the nightly instead of being clobbered.)
+make_clone_bootable(){
+  local cl="$MNT_CLONE" dev="/dev/mapper/$EXT_MAPPER"
+  # Under --dry-run nothing was actually unlocked/mounted, so the checks below would report
+  # spurious failures and make a dry run look broken. Describe the work and return clean.
+  if [ "$DRYRUN" = 1 ]; then
+    echo "DRYRUN: make target '$CLONE_TARGET' bootable (repoint fstab/crypttab/grub -> its own UUIDs, build default+fallback initramfs, grub-install BIOS+UEFI)"
+    return 0
+  fi
+  [ -e "$dev" ] || { fail "clone-boot: $dev not open"; return 1; }
+  mountpoint -q "$cl" && mountpoint -q "$cl/boot" || { fail "clone-boot: clone not mounted at $cl(+/boot)"; return 1; }
+  local part disk btrfs_uuid
+  part=$(basename "$(readlink -f "/dev/disk/by-uuid/$EXT_LUKS_UUID")")   # e.g. sdb2 / nvme0n1p2
+  # Resolve the WHOLE DISK holding that partition. Do NOT use `lsblk -no pkname | head -1`: once
+  # the LUKS mapper is open, lsblk prints one row per device in the subtree and the row ORDER is
+  # not guaranteed — for sdb2 the disk came first, for nvme0n1p2 the partition did, so head -1
+  # silently handed grub-install a partition instead of a disk. The inverse walk is unambiguous:
+  # its last line is always the top-level disk.
+  disk=$(lsblk -rnso NAME "/dev/$part" 2>/dev/null | tail -1)           # e.g. sdb / nvme0n1
+  # Safety guard. The danger is writing GRUB onto the disk the RUNNING system boots from, which
+  # would wreck the live bootloader — so check for that directly instead of allow-listing "sd*"
+  # (which would wrongly refuse a perfectly valid internal NVMe clone target).
+  case "$disk" in
+    sd*[0-9]|nvme*p[0-9]*|mmcblk*p[0-9]*) fail "clone-boot: resolved '$disk' is a PARTITION, not a disk — refusing grub-install"; return 1;;
+    sd*|nvme*|mmcblk*) : ;;
+    *) fail "clone-boot: '$disk' does not look like a whole disk — refusing grub-install"; return 1;;
+  esac
+  [ -b "/dev/$disk" ] && [ "$(lsblk -dnro TYPE "/dev/$disk" 2>/dev/null)" = disk ] \
+    || { fail "clone-boot: /dev/$disk is not a whole-disk block device — refusing grub-install"; return 1; }
+  # Resolve the physical disk behind a mountpoint. Must use `lsblk -rnso` (raw, inverse) and take
+  # the LAST line: plain `-o pkname` returns EMPTY for a dm/LUKS device like /dev/mapper/aegixluks,
+  # which would silently defeat this guard entirely.
+  _phys_disk_of(){
+    local src; src=$(findmnt -no SOURCE "$1" 2>/dev/null | sed 's/\[.*\]$//')
+    [ -n "$src" ] || return 0
+    lsblk -rnso NAME "$src" 2>/dev/null | tail -1
+  }
+  local rootdisk bootdisk
+  rootdisk=$(_phys_disk_of /)
+  bootdisk=$(_phys_disk_of /boot)
+  if [ -z "$rootdisk" ]; then
+    fail "clone-boot: cannot resolve the running system's disk — refusing to grub-install blind"; return 1
+  fi
+  local protected
+  for protected in "$rootdisk" "$bootdisk"; do
+    if [ -n "$protected" ] && [ "$disk" = "$protected" ]; then
+      fail "clone-boot: REFUSING — /dev/$disk is the RUNNING SYSTEM's disk (root=$rootdisk boot=$bootdisk)"; return 1
+    fi
+  done
+  btrfs_uuid=$(blkid -s UUID -o value "$dev")
+  [ -n "$btrfs_uuid" ] || { fail "clone-boot: cannot read external btrfs UUID"; return 1; }
+  log "clone-boot: repoint -> btrfs=$btrfs_uuid luks=$EXT_LUKS_UUID boot=$EXT_BOOT_UUID mapper=$EXT_MAPPER disk=/dev/$disk"
+  if [ "$DRYRUN" = 1 ]; then echo "DRYRUN: rewrite $cl/etc/{fstab,crypttab,default/grub}; chroot mkinitcpio+grub-install /dev/$disk"; return 0; fi
+  # fstab: clone-local UUIDs only (internal-only data drives intentionally omitted so an absent
+  # internal disk can't stall the recovery boot).
+  cat > "$cl/etc/fstab" <<EOF
+# DR clone fstab — generated by aegix-backup $(ts)
+UUID=$btrfs_uuid	/	btrfs	rw,relatime,compress=lzo,ssd,space_cache=v2,subvol=/@	0 0
+UUID=$btrfs_uuid	/home	btrfs	rw,relatime,compress=lzo,ssd,space_cache=v2,subvol=/@home	0 0
+UUID=$EXT_BOOT_UUID	/boot	vfat	rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro	0 2
+EOF
+  # crypttab -> external LUKS + mapper
+  printf '%s UUID=%s none luks\n' "$EXT_MAPPER" "$EXT_LUKS_UUID" > "$cl/etc/crypttab"
+  # GRUB cmdline -> external LUKS + mapper (rewrite the source; grub-mkconfig regenerates below)
+  sed -i \
+    -e "s|cryptdevice=UUID=[0-9a-fA-F-]\+:[A-Za-z0-9_]\+|cryptdevice=UUID=$EXT_LUKS_UUID:$EXT_MAPPER|g" \
+    -e "s|root=/dev/mapper/[A-Za-z0-9_]\+|root=/dev/mapper/$EXT_MAPPER|g" \
+    "$cl/etc/default/grub"
+  grep -q "cryptdevice=UUID=$EXT_LUKS_UUID:$EXT_MAPPER" "$cl/etc/default/grub" \
+    || { fail "clone-boot: grub cmdline rewrite failed (no cryptdevice in $cl/etc/default/grub?)"; return 1; }
+  # chroot: regenerate initramfs, install GRUB to the EXTERNAL MBR, regenerate grub.cfg
+  local d crc
+  for d in dev proc sys run; do run mount --rbind "/$d" "$cl/$d"; run mount --make-rslave "$cl/$d"; done
+  cp -L /etc/resolv.conf "$cl/etc/resolv.conf" 2>/dev/null || true
+  # Recreate the essential directories that the clone deliberately EXCLUDES the contents of.
+  # rsync --exclude=/tmp copies no /tmp at all, so a FRESH target has no /tmp — mkinitcpio then
+  # dies with "Failed to create temporary working directory in /tmp", and more importantly the
+  # clone would be a broken system when booted. These must exist (empty) with correct modes.
+  # A long-lived clone hides this bug because the dirs already exist from an earlier bootstrap.
+  local d
+  for d in tmp var/tmp proc sys dev run mnt; do run mkdir -p "$cl/$d"; done
+  if [ "$DRYRUN" != 1 ]; then chmod 1777 "$cl/tmp" "$cl/var/tmp"; fi
+
+  # PORTABILITY: build a FALLBACK initramfs as well. The normal image is built with mkinitcpio's
+  # 'autodetect' hook, so it contains ONLY the drivers for the machine it was cloned from — boot it
+  # on a different laptop and it panics with no storage driver, which is precisely the scenario a
+  # travel/DR clone exists for. 'fallback' omits autodetect (-S autodetect) so the image carries
+  # every module and boots on arbitrary hardware. The clone's preset is overwritten by the /etc
+  # rsync on every run, so we must rewrite it here every time.
+  run mkdir -p "$cl/etc/mkinitcpio.d"
+  if [ "$DRYRUN" != 1 ]; then
+    cat > "$cl/etc/mkinitcpio.d/linux.preset" <<'PRESET'
+# DR clone preset — generated by aegix-backup. Do not hand-edit: regenerated on every clone.
+# 'fallback' drops autodetect so the image contains ALL modules -> boots on arbitrary hardware.
+ALL_kver="/boot/vmlinuz-linux"
+PRESETS=('default' 'fallback')
+default_image="/boot/initramfs-linux.img"
+fallback_image="/boot/initramfs-linux-fallback.img"
+fallback_options="-S autodetect"
+PRESET
+  fi
+
+  # Install BOTH boot paths so the clone works on legacy-BIOS AND UEFI firmware:
+  #  - i386-pc  -> GRUB stage1 in the external's MBR (legacy/CSM boot)
+  #  - x86_64-efi --removable -> EFI/BOOT/BOOTX64.EFI on the ESP, the fallback path that firmware
+  #    always offers for removable media (no NVRAM entry needed, so it works booted from BIOS too).
+  # UEFI failure is non-fatal — never let it break the working BIOS path.
+  chroot "$cl" /bin/bash -c "set -e
+    mkinitcpio -P
+    grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/$disk
+    grub-install --target=x86_64-efi --efi-directory=/boot --boot-directory=/boot --removable --recheck \
+      || echo 'WARN: UEFI grub-install failed (BIOS path still installed)'
+    grub-mkconfig -o /boot/grub/grub.cfg"
+  crc=$?
+  for d in run sys proc dev; do run umount -R "$cl/$d" 2>/dev/null || true; done
+  run sync
+  # verify the regenerated grub.cfg actually points at the EXTERNAL LUKS now (not the internal)
+  if grep -q "cryptdevice=UUID=$EXT_LUKS_UUID:$EXT_MAPPER" "$cl/boot/grub/grub.cfg" 2>/dev/null; then
+    local fw="BIOS-only"
+    [ -e "$cl/boot/EFI/BOOT/BOOTX64.EFI" ] && fw="BIOS+UEFI"
+    log "clone-boot: clone is bootable $fw (grub.cfg -> external LUKS $EXT_LUKS_UUID, GRUB on /dev/$disk)"
+    # Hardware portability: the fallback image is what lets this clone boot on a DIFFERENT machine.
+    if [ -e "$cl/boot/initramfs-linux-fallback.img" ]; then
+      if grep -q 'initramfs-linux-fallback.img' "$cl/boot/grub/grub.cfg" 2>/dev/null; then
+        log "clone-boot: portable fallback initramfs present AND in grub.cfg ($(du -h "$cl/boot/initramfs-linux-fallback.img" 2>/dev/null | cut -f1)) — clone can boot on other hardware"
+      else
+        fail "clone-boot: fallback initramfs built but MISSING from grub.cfg — no menu entry to boot it on other hardware"
+      fi
+    else
+      fail "clone-boot: NO fallback initramfs — clone is tied to this machine's hardware and may not boot elsewhere"
+    fi
+    log "clone-boot: ESP usage $(df -h "$cl/boot" 2>/dev/null | awk 'NR==2{print $3" / "$2" ("$5" used)"}')"
+    return 0
+  fi
+  fail "clone-boot: grub.cfg missing target LUKS after regen (chroot rc=$crc) — clone may not be bootable"
+  return 1
+}
+
+do_clone_one(){  # $1 = daily|weekly ; operates on the currently selected clone target
+  require_exclude_config || return 1
+  ext_unlock || return 1
+  mk_src_snapshots
+  ext_mount
+  local rc=0
+  local -a root_ex home_ex
+  mapfile -t root_ex < <(root_exclude_args)
+  mapfile -t home_ex < <(home_exclude_args "$1")
+  log "clone-$1[$CLONE_TARGET]: ROOT"
+  do_rsync -aHAX --delete --partial --info=progress2 \
+      "${root_ex[@]}" "$MNT_SRC_TOP/ab-snap-root/" "$MNT_CLONE/" || rc=1
+  log "clone-$1[$CLONE_TARGET]: HOME"
+  do_rsync -aHAX --delete --partial --info=progress2 \
+      "${home_ex[@]}" "$MNT_SRC_TOP/ab-snap-home/" "$MNT_CLONE/home/" || rc=1
+  log "clone-$1[$CLONE_TARGET]: BOOT"
+  do_rsync -aHAX --delete --partial /boot/ "$MNT_CLONE/boot/" || rc=1
+  # the rsyncs just overwrote /etc + /boot with the internal's UUIDs — re-make the clone bootable
+  make_clone_bootable || rc=1
+  if [ "$rc" = 0 ]; then log "clone-$1[$CLONE_TARGET]: done"; else log "clone-$1[$CLONE_TARGET]: done WITH ERRORS"; fi
+  return "$rc"
+}
+
+# Run the clone against every configured target. A target that is not attached is skipped
+# (not an error) so the nightly succeeds whether or not the travel drive is plugged in.
+do_clone(){  # $1 = daily|weekly
+  declare -p CLONE_TARGETS >/dev/null 2>&1 || { fail "config $CONF is missing CLONE_TARGETS — update it from aegix-backup.conf.example"; return 1; }
+  local rc=0 t
+  for t in "${CLONE_TARGETS[@]}"; do
+    select_clone_target "$t" || { rc=1; continue; }
+    if ! ext_present; then log "clone-$1[$t]: target not attached — skipping"; continue; fi
+    if target_is_running_system; then
+      log "clone-$1[$t]: target is the disk this system is RUNNING from — skipping (recovery mode)"; continue; fi
+    do_clone_one "$1" || rc=1
+    ext_close
+  done
+  return "$rc"
+}
+# Re-apply just the bootability step (no rsync) — for fixing/re-testing boot setup quickly.
+# clone-bootfix [target]  — with no argument, fixes every configured target.
+cmd_clone_bootfix(){
+  local rc=0 t targets=()
+  if [ -n "${BOOTFIX_TARGET:-}" ]; then targets=( "$BOOTFIX_TARGET" ); else targets=( "${CLONE_TARGETS[@]}" ); fi
+  for t in "${targets[@]}"; do
+    select_clone_target "$t" || { rc=1; continue; }
+    if ! ext_present; then log "clone-bootfix[$t]: target not attached — skipping"; continue; fi
+    if target_is_running_system; then
+      log "clone-bootfix[$t]: target is the RUNNING system — skipping"; continue; fi
+    ext_unlock || { rc=1; continue; }
+    ext_mount
+    make_clone_bootable || rc=1
+    ext_close
+  done
+  return "$rc"
+}
+cmd_clone_daily(){ do_clone daily; }
+cmd_clone_weekly(){ do_clone weekly; }
+
+# ---- external snapshots ----
+cmd_ext_snapshot(){
+  ext_present || { log "ext-snapshot: external not attached — skipping"; return 0; }
+  ext_unlock || return 1; ext_mount
+  local d; d=$(date '+%Y-%m-%d'); local sd="$MNT_DST_TOP/$EXT_SNAP_DIR"
+  run mkdir -p "$sd"
+  for sv in "$SRC_ROOT" "$SRC_HOME"; do
+    [ -e "$sd/${sv}.$d" ] && run btrfs subvolume delete "$sd/${sv}.$d"
+    run btrfs subvolume snapshot -r "$MNT_DST_TOP/$sv" "$sd/${sv}.$d"
+  done
+  # prune: keep newest EXT_SNAP_KEEP_DAILY per subvol (daily cap only; weekly retention not yet implemented)
+  for sv in "$SRC_ROOT" "$SRC_HOME"; do
+    ls -1d "$sd/${sv}."* 2>/dev/null | sort | head -n -"$EXT_SNAP_KEEP_DAILY" | while read -r old; do
+      run btrfs subvolume delete "$old" || log "ext-snapshot: WARNING failed to delete $old"
+    done || true
+  done
+  log "ext-snapshot: $d done"
+}
+
+# ---- videos (manual add-only top-up) ----
+cmd_videos(){
+  ext_present || { log "videos: external not attached — skipping"; return 0; }
+  ext_unlock || return 1; mk_src_snapshots; ext_mount
+  log "videos: add-only top-up"
+  run rsync -aHAX --partial --info=progress2 \
+      "$MNT_SRC_TOP/ab-snap-home/Videos/" "$MNT_CLONE/home/Videos/"
+  log "videos: done"
+}
+
+# ---- notes-push ----
+cmd_notes_push(){
+  log "notes-push: $NOTES_REPO"
+  # guard: the decrypted (plaintext) vault dir must be gitignored — abort if any path under it
+  # became tracked. NOTES_PLAINTEXT_DIR is repo-relative; unset = no vault in this notes repo.
+  if [ -n "${NOTES_PLAINTEXT_DIR:-}" ] && \
+     runuser -u "$AB_USER" -- git -C "$NOTES_REPO" ls-files "$NOTES_PLAINTEXT_DIR/" 2>/dev/null | grep -q .; then
+    fail "notes-push: plaintext $NOTES_PLAINTEXT_DIR is tracked — refusing"; return 1; fi
+  if [ "$DRYRUN" = 1 ]; then echo "DRYRUN: git -C $NOTES_REPO add -A && commit && push"; return 0; fi
+  local push_rc=0
+  runuser -u "$AB_USER" -- bash -c '
+    cd "$1" || exit 1
+    git add -A
+    git diff --cached --quiet && { echo "notes-push: nothing to commit"; exit 0; }
+    git commit -m "aegix-backup auto $(date +%F\ %T)" && GIT_TERMINAL_PROMPT=0 git push
+  ' -- "$NOTES_REPO" || push_rc=$?
+  log "notes-push: done (rc=$push_rc)"
+  return "$push_rc"
+}
+
+# (Re)generate the "do not delete" guard files inside a repo dir before mirroring to HF, so any
+# human/agent sharing the account sees them ON the repo. Regenerated every sync (the --delete '*'
+# mirror would otherwise wipe a hand-placed file). restic ignores these extra root files.
+write_repo_guard(){
+  local dir="$1" owner="${HF_GUARD_OWNER:-the repository owner}" note="${HF_GUARD_NOTE:-}"
+  [ "$DRYRUN" = 1 ] && { echo "DRYRUN: refresh guard files in $dir"; return 0; }
+  local notesec=""
+  [ -n "$note" ] && notesec="
+
+**Note from the owner:** $note"
+  cat > "$dir/README.md" <<GUARD
+---
+pretty_name: "PROTECTED personal backup (restic) — DO NOT DELETE"
+tags:
+- personal-backup
+- restic
+- encrypted
+- do-not-delete
+viewer: false
+---
+
+# ⛔ PROTECTED BACKUP — DO NOT DELETE, MODIFY, OR PRUNE
+
+This dataset repository is an **encrypted restic backup** of personal data
+belonging to **$owner**. For some files this may be the ONLY surviving copy.
+
+## For any human or AI agent managing this HuggingFace account
+
+This account's storage is SHARED. This repo is a disaster-recovery backup and must be
+left completely untouched. If you are freeing space, cleaning up, or reorganizing for
+some other task: **skip this repo entirely.**$notesec
+
+### Do NOT, under any circumstances:
+- Delete this repository.
+- Delete, rename, move, or modify ANY file in it — especially anything under
+  **data/**, **index/**, **keys/**, **snapshots/**, or the **config** file.
+- "Prune", "clean up", "deduplicate", or "compress" it to reclaim quota.
+- Make it public.
+
+### Why this matters
+A restic repository is a set of encrypted, content-addressed pack files. **Removing
+even one pack file can permanently destroy the ability to restore the backup** — and
+because the contents are encrypted, you cannot tell from the outside what is safe to
+remove. Nothing here is safe to remove; the whole repo is one indivisible unit.
+
+## Technically
+- restic repository (AES-256, client-side encrypted). Opaque ciphertext by design.
+- Managed automatically by **aegix-backup**. This README and AGENTS.md are regenerated
+  on every sync; edits here will be overwritten.
+- If in doubt: STOP and ask $owner. Do not delete.
+GUARD
+  cat > "$dir/AGENTS.md" <<GUARD
+# AGENTS.md — operating rules for this HuggingFace repo
+
+REPO_CLASS: personal-encrypted-backup
+STATUS: PROTECTED / DO-NOT-DELETE
+TOOL: aegix-backup (restic mirror)
+OWNER: $owner
+
+RULES FOR AGENTS:
+- Do NOT delete this repository or any file in it.
+- Do NOT prune / clean / dedupe / compress it to reclaim storage quota.
+- Do NOT modify files. This is a restic repo; removing any pack file can make the
+  ENTIRE backup unrecoverable, and the contents are encrypted so you cannot judge
+  what is "safe" to remove. The answer is: nothing.
+- This account is SHARED with other assets. This repo is NOT one of them — when
+  managing storage for other tasks, EXCLUDE this repo.
+- If you believe you must touch this repo, STOP and ask the owner first.$notesec
+
+See README.md for the human-readable version.
+GUARD
+}
+
+# ---- pictures (restic backup + HF mirror) ----
+cmd_pictures(){
+  # Repo lives on the always-present internal LUKS SSD, NOT the external DR drive — so this runs
+  # unattended with nothing plugged in.
+  local_up || return 1
+  local_present || { log "pictures: restic disk not present — skipping"; return 0; }
+  local repo="$LOCAL_MNT/pictures"
+  # chown to the user's LOGIN group (trailing colon), not a same-name user-private group — the
+  # account's primary group may be wheel/users/etc. (portable across distros; shareable).
+  run mkdir -p "$repo"; run chown -R "$AB_USER": "$LOCAL_MNT"
+  if [ "$DRYRUN" != 1 ]; then
+    [ -r "$RESTIC_PW_FILE" ] || { fail "pictures: restic pw file $RESTIC_PW_FILE missing"; return 1; }
+  fi
+  if [ "$DRYRUN" = 1 ]; then
+    echo "DRYRUN: restic -r $repo backup $PICTURES_SRC; restic forget --prune; hf upload $HF_PICTURES_REPO $repo"; return 0; fi
+  # auto-init the restic repo on first use
+  restic_u -r "$repo" snapshots >/dev/null 2>&1 || restic_u -r "$repo" init \
+    || { fail "pictures: restic init failed"; return 1; }
+  # backup as the user. restic exit 3 == snapshot saved but at least one source file was unreadable
+  # (e.g. the known-corrupt media on the worn NVMe) — that is a WARNING, not a failure, so we must
+  # NOT bail (bailing here would skip the HF upload). Anything other than 0/3 is fatal.
+  restic_u -r "$repo" backup "$PICTURES_SRC" --tag aegix-auto; local rc=$?
+  case "$rc" in
+    0) ;;
+    3) log "pictures: restic backup completed with warnings (exit 3 — some source files unreadable, e.g. known-corrupt media); snapshot saved";;
+    *) fail "pictures: restic backup failed (exit $rc)"; return 1;;
+  esac
+  restic_u -r "$repo" forget "${RESTIC_KEEP[@]}" --prune || log "pictures: prune warning"
+  # drop/refresh the "do not delete" guard files so they ride along in the mirror
+  write_repo_guard "$repo"; run chown "$AB_USER": "$repo/README.md" "$repo/AGENTS.md" 2>/dev/null || true
+  # mirror the repo to HF (folder sync; --delete keeps HF == local after prune)
+  # --private: personal backup data. Even though restic already encrypts everything, keep the
+  # ciphertext repo out of public view (defense in depth). Only applied at repo creation.
+  # --delete '*' : glob of remote files to remove during the commit, so HF ends up == local repo
+  # after a prune (this hf version's --delete takes patterns, not a bare flag).
+  as_user hf upload "$HF_PICTURES_REPO" "$repo" . --repo-type dataset --private --delete '*' \
+    || { fail "pictures: hf upload failed"; return 1; }
+  log "pictures: done"
+}
+
+# ---- on-demand read-only browse of a clone target ----
+# Deliberately NOT automatic for internal targets: an always-mounted full duplicate of the
+# filesystem confuses anything that walks the disk (updatedb/locate, du, editor project search)
+# and keeps a LUKS mapper open around the clock for no daily benefit. The removable drive is
+# different — it has a plug event — so that one keeps its udev auto-mount.
+BROWSE_BASE=${BROWSE_BASE:-/mnt/aegix-browse}
+cmd_clone_browse(){
+  local t="${BROWSE_TARGET:-}"
+  [ -n "$t" ] || { echo "usage: aegix-backup clone-browse <target>   (available: ${CLONE_TARGETS[*]})"; return 1; }
+  select_clone_target "$t" || return 1
+  ext_present || { fail "clone-browse[$t]: target not attached"; return 1; }
+  local m="$BROWSE_BASE/$t"
+  ext_unlock || return 1
+  run mkdir -p "$m"
+  mountpoint -q "$m" || run mount -o "ro,subvol=$SRC_ROOT" "/dev/mapper/$EXT_MAPPER" "$m" || {
+    fail "clone-browse[$t]: read-only mount failed"; return 1; }
+  run mkdir -p "$m/home"
+  mountpoint -q "$m/home" || run mount -o "ro,subvol=$SRC_HOME" "/dev/mapper/$EXT_MAPPER" "$m/home" 2>/dev/null || true
+  log "clone-browse[$t]: mounted READ-ONLY at $m  (release with: aegix-backup clone-unbrowse $t)"
+}
+cmd_clone_unbrowse(){
+  local t="${BROWSE_TARGET:-}"
+  [ -n "$t" ] || { echo "usage: aegix-backup clone-unbrowse <target>   (available: ${CLONE_TARGETS[*]})"; return 1; }
+  select_clone_target "$t" || return 1
+  local m="$BROWSE_BASE/$t"
+  mountpoint -q "$m/home" && run umount "$m/home" 2>/dev/null || true
+  mountpoint -q "$m"      && run umount "$m"      2>/dev/null || true
+  run rmdir "$m/home" "$m" 2>/dev/null || true
+  [ -e "/dev/mapper/$EXT_MAPPER" ] && run cryptsetup luksClose "$EXT_MAPPER" 2>/dev/null || true
+  log "clone-unbrowse[$t]: released"
+}
+
+# ---- daily orchestrator ----
+cmd_daily(){
+  local dow; dow=$(date +%u)      # 1=Mon..7=Sun
+  local rc=0
+  log "===== daily start ====="
+  cmd_notes_push        || rc=1                       # network only
+  if ext_present; then
+    if [ "$dow" = 7 ]; then do_clone weekly || rc=1; else do_clone daily || rc=1; fi
+    cmd_ext_snapshot    || rc=1
+    cmd_pictures        || rc=1
+  else
+    log "daily: external not attached — clone/snapshot/pictures skipped"
+  fi
+  if [ "$rc" = 0 ]; then echo "$(ts) OK" > "$STATUS_FILE"; log "===== daily OK ====="
+  else log "===== daily completed WITH ERRORS ====="; fi
+  return "$rc"
+}
+
+# ---- dispatch ----
+case "${1:-}" in
+  --dry-run) DRYRUN=1; shift;;
+esac
+case "${1:-}" in
+  clone-browse|clone-unbrowse)
+    # No ext_close trap: a browse mount must PERSIST after this process exits.
+    BROWSE_TARGET="${2:-}"; "cmd_${1//-/_}";;
+  clone-bootfix)
+    BOOTFIX_TARGET="${2:-}"
+    acquire_lock; warn_plaintext; trap 'ext_close 2>/dev/null || true' EXIT INT TERM; cmd_clone_bootfix;;
+  clone-daily|clone-weekly|videos|ext-snapshot|notes-push|pictures)
+    acquire_lock; warn_plaintext; trap 'ext_close 2>/dev/null || true' EXIT INT TERM; "cmd_${1//-/_}";;
+  daily|now)
+    acquire_lock; warn_plaintext; trap 'ext_close 2>/dev/null || true' EXIT INT TERM; cmd_daily;;
+  automount-up|automount-down|automount-sync)
+    # No ext_close trap: the interactive mount must PERSIST after this process exits.
+    # cmd_automount_up does its own non-blocking lock internally.
+    "cmd_${1//-/_}";;
+  local-up)
+    # No ext_close trap: the restic disk is the permanent repo home and must stay mounted.
+    cmd_local_up;;
+  preflight) cmd_preflight;;
+  *) usage; exit 1;;
+esac

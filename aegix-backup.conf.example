@@ -1,0 +1,114 @@
+# /etc/aegix-backup.conf  — sourced by aegix-backup (root-only, chmod 0600)
+#
+# Copy this file to /etc/aegix-backup.conf and replace every <PLACEHOLDER>.
+# Find your UUIDs with:  lsblk -o NAME,MODEL,SERIAL,FSTYPE,LABEL,UUID
+#
+# ===== identity =====
+AB_USER=<youruser>                   # the human whose home is backed up
+AB_HOME=/home/<youruser>
+
+# ===== internal source (the system being backed up) =====
+# NOTE: at runtime the tool derives the real source from the running root (findmnt -no SOURCE /),
+# so recovery-mode runs (booted from a clone) work even though this mapper doesn't exist there.
+SRC_LUKS=/dev/mapper/<system-mapper> # opened internal root LUKS (mounted while booted)
+SRC_ROOT=@
+SRC_HOME=@home
+
+# ===== clone targets =====
+# NEVER identify these by /dev/nvmeXn1 — Linux NVMe naming is NOT stable across reboots. Everything
+# below keys off UUID for exactly that reason; put the MODEL/SERIAL in the comment for humans.
+# The clone runs against each target in turn; a target that isn't attached is skipped (not an
+# error), so the nightly works whether or not the travel drive is plugged in. Each target is a
+# full, independently bootable copy. Order matters only for which runs first.
+#   internal — always-present second disk. Survives a primary-drive failure; boot it from the
+#              firmware boot menu in minutes.
+#   external — the drive that leaves the building. Survives the laptop being lost/stolen/destroyed.
+CLONE_TARGETS=( internal external )
+
+TGT_internal_LUKS_UUID=<luks-uuid-of-internal-clone-partition>   # <model/serial for humans>
+TGT_internal_BOOT_UUID=<vfat-uuid-of-internal-clone-boot-part>   # e.g. label INTCLONEBT
+TGT_internal_MAPPER=aegixclone
+TGT_internal_KEYFILE=/etc/cryptsetup-keys.d/aegixclone.key
+
+TGT_external_LUKS_UUID=<luks-uuid-of-external-clone-partition>   # <enclosure/drive for humans>
+TGT_external_BOOT_UUID=<vfat-uuid-of-external-clone-boot-part>   # e.g. label CLONEBOOT
+TGT_external_MAPPER=aegixbackup
+TGT_external_KEYFILE=/etc/cryptsetup-keys.d/aegixbackup.key
+
+# ===== external backup drive (defaults; also what the interactive auto-mount acts on) =====
+EXT_LUKS_UUID=<same-as-TGT_external_LUKS_UUID>
+EXT_BOOT_UUID=<same-as-TGT_external_BOOT_UUID>
+EXT_MAPPER=aegixbackup
+EXT_KEYFILE=/etc/cryptsetup-keys.d/aegixbackup.key
+# The udev/runit browse-mount only ever applies to the removable drive, never an internal target.
+AUTOMOUNT_MAPPER=aegixbackup
+
+# ===== mount points (auto-created) =====
+MNT_SRC_TOP=/mnt/ab-src-top          # internal top-level (subvolid=5) for snapshots
+MNT_DST_TOP=/mnt/ab-dst-top          # target top-level (for @/@home rw-flip + ext snapshots)
+MNT_CLONE=/mnt/ab-clone              # target @ (with /home and /boot mounted under it)
+
+# ===== clone excludes (rsync patterns) =====
+# CRITICAL: patterns are anchored at each rsync's TRANSFER ROOT, not at "/". The clone runs two
+# rsyncs from two roots: ROOT copies the @ subvol (root == "/"), HOME copies the @home subvol
+# (root == the dir that holds the user homes, so a path there is "/<username>/...", NOT
+# "/home/<username>/..."). Anchoring HOME patterns with a "/home/" prefix silently matches nothing.
+#
+# ROOT (@) transfer — anchored at "/" :
+EXCLUDE_ROOT=( "/home" "/boot" "/.snapshots" "/swapfile" "/tmp" "/var/tmp" "/var/cache/pacman/pkg" "/var/lib/pacman/sync" "lost+found" )
+# HOME (@home) transfer — anchored at the @home root, where "/*/" == "/<username>/" :
+# Regenerable junk + (if you use one) the decrypted gocryptfs mountpoint. NOTE the trailing '/**'
+# on a vault exclude: it excludes the CONTENTS (plaintext, when the vault is mounted) but KEEPS the
+# empty mountpoint directory. Excluding the directory itself omits it entirely, and gocryptfs then
+# cannot mount on a recovered system — you'd have the ciphertext and no way to open it. Found by an
+# actual test-boot of the clone.
+EXCLUDE_HOME_ALWAYS=( "/*/.cache" "/*/.npm" "/*/.cargo/registry" "/*/.local/share/cargo/registry" "/*/.local/share/Trash" "/*/.ollama" "/*/<path-to-decrypted-vault>/**" "node_modules" "target" "lost+found" )
+# Handled by dedicated subcommands (Videos via `videos` add-only top-up, Pictures via `pictures`/restic):
+EXCLUDE_HOME_SEPARATE=( "/*/Videos" "/*/Pictures" )
+# Excluded from DAILY only (kept in the weekly full): large/static high-file-count dirs:
+EXCLUDE_HOME_DAILY_EXTRA=( )
+
+# ===== external-side version snapshots =====
+EXT_SNAP_DIR=snapshots               # under MNT_DST_TOP
+EXT_SNAP_KEEP_DAILY=7
+# EXT_SNAP_KEEP_WEEKLY=4   # TODO: weekly retention not yet implemented (daily cap only)
+
+# ===== B1 notes -> git remote =====
+NOTES_REPO=/home/<youruser>/<notes-repo>
+# Repo-relative dir holding DECRYPTED vault plaintext, if any — the push guard refuses to push if
+# anything under it ever becomes git-tracked. Leave unset if your notes repo has no such dir.
+#NOTES_PLAINTEXT_DIR="<relative/path/to/plaintext-vault>"
+
+# ===== local restic disk (always-present internal LUKS disk hosting the restic repo) =====
+# The restic repo lives here — NOT on the external DR drive — so the Pictures offsite runs nightly
+# and unattended with nothing plugged in. LUKS2, auto-unlocked at boot with LOCAL_KEYFILE by the
+# runit service 'aegix-restic-mount' (crypttab is not processed on Artix/runit). The keyfile lives
+# on the passphrase-protected encrypted root, so a stolen powered-off laptop can't unlock it.
+LOCAL_LUKS_UUID=<luks-uuid-of-restic-disk>
+LOCAL_MAPPER=aegix-restic
+LOCAL_KEYFILE=/etc/cryptsetup-keys.d/aegix-restic.key
+LOCAL_MNT=/mnt/aegix-restic          # restic repo goes in $LOCAL_MNT/pictures
+
+# ===== B2 Pictures -> restic -> Hugging Face =====
+PICTURES_SRC=/home/<youruser>/Pictures
+RESTIC_PW_FILE=/home/<youruser>/.config/aegix-backup/restic.key
+HF_PICTURES_REPO=<hf-user>/pictures-restic
+RESTIC_KEEP=( --keep-daily 7 --keep-weekly 8 --keep-monthly 12 )
+# Guard files (README.md + AGENTS.md) are (re)generated inside the repo on every sync so other
+# humans/agents sharing the HF account know NOT to delete/prune this backup. Owner + optional note:
+HF_GUARD_OWNER="<Your Name>"
+HF_GUARD_NOTE=""
+
+# ===== interactive auto-mount (udev + runit one-shot) =====
+# When you physically plug the drive into this (running, unlocked) machine, a udev rule pokes a
+# runit one-shot that unlocks it with EXT_KEYFILE and mounts it READ-ONLY here so you can browse
+# the clone without any risk of clobbering your recovery image. The nightly backup does its own
+# separate read-write mount and will reclaim the drive if it's held by this interactive mount.
+AUTOMOUNT_ENABLE=1
+AUTOMOUNT_MNT=/mnt/aegixbackup       # read-only browse mount for the plugged-in drive
+AUTOMOUNT_MARKER=/run/aegix-automount.active
+
+# ===== ops =====
+LOG_DIR=/var/log/aegix-backup
+STATUS_FILE=/home/<youruser>/aegix-backup-LAST.status
+NOTIFY_USER=<youruser>               # desktop notify target (notify-send via their DISPLAY)

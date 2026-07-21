@@ -1,0 +1,6 @@
+#!/bin/sh
+# udev -> runit bridge for aegix-backup auto-mount. install.sh substitutes __SVDIR__ with the
+# active runit scan dir. `sv once` returns quickly after runsv forks ./run, so the udev worker
+# isn't held; the unlock+mount then completes under runit supervision.
+export SVDIR="__SVDIR__"
+exec sv once aegix-automount

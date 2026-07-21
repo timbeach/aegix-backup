@@ -1,0 +1,6 @@
+# aegix-backup interactive auto-mount. Installed to /etc/udev/rules.d/99-aegix-automount.rules
+# with __EXT_LUKS_UUID__ substituted by install.sh. Matches the external DR drive by its LUKS
+# partition UUID (never sdX, which floats) and pokes the runit one-shot on plug AND unplug.
+# The wrapper returns fast; the actual unlock+mount runs under runit.
+ACTION=="add",    SUBSYSTEM=="block", ENV{ID_FS_UUID}=="__EXT_LUKS_UUID__", RUN+="/usr/local/lib/aegix-backup/automount-udev"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="__EXT_LUKS_UUID__", RUN+="/usr/local/lib/aegix-backup/automount-udev"

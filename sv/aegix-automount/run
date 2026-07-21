@@ -1,0 +1,6 @@
+#!/bin/sh
+# aegix-automount runit one-shot. Poked by the udev rule via `sv once aegix-automount` on drive
+# plug/unplug. Runs the mount under runit's supervision (not udev's) so it's kill-safe and the
+# mount is visible system-wide. `sv once` does not restart it after ./run exits.
+exec 2>&1
+exec /usr/local/sbin/aegix-backup automount-sync
