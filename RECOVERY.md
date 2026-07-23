@@ -60,8 +60,15 @@ You can now work indefinitely from the clone. Do §3 when convenient.
 Do this from a running system (your recovered clone is fine).
 
 1. Fit the new drive. Identify it **by model/serial**, never by `/dev/nvmeXn1`.
-2. Provision it to match a bootable layout: MBR, a ~1 GB FAT32 partition with the **boot flag**,
-   then the rest as LUKS2 → btrfs with `@` and `@home` subvolumes.
+2. Provision it to a bootable layout. **Match your firmware:**
+   - Legacy/CSM machine (boots MBR disks): MBR table — a ~1 GB FAT32 partition with the
+     **boot flag**, then the rest as LUKS2 → btrfs with `@` and `@home` subvolumes.
+   - **UEFI-only machine (e.g. Framework laptops — no CSM):** GPT table — a 1 MB **BIOS-boot**
+     partition (type EF02; costs nothing and lets the same drive also boot legacy machines),
+     a ~1 GB FAT32 **ESP** (type EF00), then the rest as LUKS2 → btrfs `@`/`@home`.
+     Note: some firmware won't even offer UEFI boot from an MBR disk, so GPT is the safe
+     default for a drive that must boot anywhere. The tool auto-detects the table type and
+     installs the right GRUB path(s).
 3. Add a **keyfile** keyslot (for unattended backups) *and* a **passphrase** keyslot (you need this
    to unlock at boot; a keyfile-only volume cannot be unlocked at the initramfs prompt).
 4. Add it to `CLONE_TARGETS` in the config with its own `TGT_<name>_*` UUIDs.

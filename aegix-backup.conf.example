@@ -73,13 +73,14 @@ EXT_SNAP_DIR=snapshots               # under MNT_DST_TOP
 EXT_SNAP_KEEP_DAILY=7
 # EXT_SNAP_KEEP_WEEKLY=4   # TODO: weekly retention not yet implemented (daily cap only)
 
-# ===== B1 notes -> git remote =====
+# ===== B1 notes -> git remote (OPTIONAL LEG — leave NOTES_REPO empty/unset to disable) =====
 NOTES_REPO=/home/<youruser>/<notes-repo>
 # Repo-relative dir holding DECRYPTED vault plaintext, if any — the push guard refuses to push if
 # anything under it ever becomes git-tracked. Leave unset if your notes repo has no such dir.
 #NOTES_PLAINTEXT_DIR="<relative/path/to/plaintext-vault>"
 
-# ===== local restic disk (always-present internal LUKS disk hosting the restic repo) =====
+# ===== local restic disk (OPTIONAL LEG with B2 — leave LOCAL_LUKS_UUID/PICTURES_SRC empty/unset
+# to disable the whole pictures/offsite leg, e.g. for a clone-only install) =====
 # The restic repo lives here — NOT on the external DR drive — so the Pictures offsite runs nightly
 # and unattended with nothing plugged in. LUKS2, auto-unlocked at boot with LOCAL_KEYFILE by the
 # runit service 'aegix-restic-mount' (crypttab is not processed on Artix/runit). The keyfile lives

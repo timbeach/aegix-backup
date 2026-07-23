@@ -47,9 +47,14 @@ sudoedit /etc/aegix-backup.conf     # replace every <PLACEHOLDER>
 sudo aegix-backup preflight
 ```
 
-You will also need, per clone target: a partitioned disk (MBR: ~1 GB FAT32 boot partition with the
-boot flag + the rest LUKS2 → btrfs with `@`/`@home`), a keyfile keyslot (for unattended runs) and a
-passphrase keyslot (to unlock at boot). `RECOVERY.md` §3 walks through provisioning a fresh target.
+You will also need, per clone target: a partitioned disk (legacy firmware: MBR with a ~1 GB
+boot-flagged FAT32 + LUKS2→btrfs `@`/`@home`; UEFI-only firmware such as Framework laptops: GPT
+with a 1 MB BIOS-boot partition + ~1 GB ESP + LUKS2 — the tool detects the table type and installs
+the right GRUB paths), a keyfile keyslot (for unattended runs) and a passphrase keyslot (to unlock
+at boot). `RECOVERY.md` §3 walks through provisioning a fresh target.
+
+The notes and pictures/offsite legs are **optional** — leave `NOTES_REPO` / the restic block
+unset for a clone-only install (e.g. a one-drive-slot laptop with an external clone target).
 
 Then arm the nightly (already installed by `install.sh` as `/etc/cron.daily/aegix-backup`) by
 making sure cronie + anacron run. Test everything first:

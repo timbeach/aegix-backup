@@ -9,6 +9,11 @@ DRYRUN=0
 # shellcheck disable=SC1090
 . "$CONF"
 mkdir -p "$LOG_DIR"
+# Which legs are configured? Empty/unset config disables a leg cleanly (clone-only installs are
+# first-class: one drive slot + no offsite is a legitimate day-one setup).
+notes_leg_enabled(){ [ -n "${NOTES_REPO:-}" ]; }
+pictures_leg_enabled(){ [ -n "${PICTURES_SRC:-}" ] && [ -n "${LOCAL_LUKS_UUID:-}" ]; }
+
 # Capture the config's EXT_* values (the removable/external drive) before anything mutates them:
 # select_clone_target() rebinds these globals per-target, so after a multi-target clone they point
 # at whichever target ran LAST. Anything that means "the external drive specifically" (ext-snapshot,
@@ -80,19 +85,29 @@ acquire_lock(){ exec 9>"$LOCK"; flock -n 9 || { echo "another aegix-backup is ru
 # ---- prerequisite/sanity check ----
 cmd_preflight(){
   local ok=1
-  for b in rsync btrfs cryptsetup restic git; do command -v "$b" >/dev/null || { echo "MISSING binary: $b"; ok=0; }; done
-  as_user sh -c 'command -v hf' >/dev/null 2>&1 || { echo "MISSING: hf for $AB_USER (looked on $USER_PATH)"; ok=0; }
+  for b in rsync btrfs cryptsetup; do command -v "$b" >/dev/null || { echo "MISSING binary: $b"; ok=0; }; done
   [ -e "$SRC_LUKS" ] || { echo "MISSING source LUKS $SRC_LUKS"; ok=0; }
-  # local restic disk (holds the repo): keyfile must exist and the LUKS device should be present
-  [ -r "$LOCAL_KEYFILE" ] || { echo "MISSING local restic keyfile $LOCAL_KEYFILE"; ok=0; }
-  local_present || echo "WARN: local restic disk (LOCAL_LUKS_UUID=$LOCAL_LUKS_UUID) not present — pictures will skip"
-  [ -r "$RESTIC_PW_FILE" ] || { echo "MISSING restic password file $RESTIC_PW_FILE"; ok=0; }
   for v in EXCLUDE_ROOT EXCLUDE_HOME_ALWAYS EXCLUDE_HOME_SEPARATE EXCLUDE_HOME_DAILY_EXTRA; do
     declare -p "$v" >/dev/null 2>&1 || { echo "MISSING config array: $v (update $CONF from .conf.example)"; ok=0; }
   done
-  # non-interactive git push?
-  if ! runuser -u "$AB_USER" -- env GIT_TERMINAL_PROMPT=0 git -C "$NOTES_REPO" ls-remote >/dev/null 2>&1; then
-    echo "WARN: '$NOTES_REPO' git remote not reachable non-interactively (notes-push will fail)"; ok=0; fi
+  # Legs are OPTIONAL: a clone-only install (e.g. a laptop with one drive slot and no offsite yet)
+  # must preflight clean. Each leg's prerequisites are checked only when that leg is configured.
+  if pictures_leg_enabled; then
+    command -v restic >/dev/null || { echo "MISSING binary: restic (pictures leg)"; ok=0; }
+    as_user sh -c 'command -v hf' >/dev/null 2>&1 || { echo "MISSING: hf for $AB_USER (pictures leg; looked on $USER_PATH)"; ok=0; }
+    [ -r "${LOCAL_KEYFILE:-}" ] || { echo "MISSING local restic keyfile ${LOCAL_KEYFILE:-<unset>}"; ok=0; }
+    local_present || echo "WARN: local restic disk (LOCAL_LUKS_UUID=${LOCAL_LUKS_UUID:-}) not present — pictures will skip"
+    [ -r "${RESTIC_PW_FILE:-}" ] || { echo "MISSING restic password file ${RESTIC_PW_FILE:-<unset>}"; ok=0; }
+  else
+    echo "note: pictures/offsite leg not configured — skipping its checks"
+  fi
+  if notes_leg_enabled; then
+    command -v git >/dev/null || { echo "MISSING binary: git (notes leg)"; ok=0; }
+    if ! runuser -u "$AB_USER" -- env GIT_TERMINAL_PROMPT=0 git -C "$NOTES_REPO" ls-remote >/dev/null 2>&1; then
+      echo "WARN: '$NOTES_REPO' git remote not reachable non-interactively (notes-push will fail)"; ok=0; fi
+  else
+    echo "note: notes leg not configured — skipping its checks"
+  fi
   if [ "$ok" = 1 ]; then echo "preflight OK"; else echo "preflight FAILED"; return 1; fi
 }
 
@@ -375,15 +390,28 @@ PRESET
   fi
 
   # Install BOTH boot paths so the clone works on legacy-BIOS AND UEFI firmware:
-  #  - i386-pc  -> GRUB stage1 in the external's MBR (legacy/CSM boot)
+  #  - i386-pc  -> GRUB stage1 in the MBR / GPT BIOS-boot partition (legacy/CSM boot)
   #  - x86_64-efi --removable -> EFI/BOOT/BOOTX64.EFI on the ESP, the fallback path that firmware
   #    always offers for removable media (no NVRAM entry needed, so it works booted from BIOS too).
-  # UEFI failure is non-fatal — never let it break the working BIOS path.
+  # WHICH path is required depends on the partition table: i386-pc on a GPT disk needs a BIOS-boot
+  # partition (type EF02) to embed into and fails hard without one — and a UEFI-only machine
+  # (e.g. Framework laptops, no CSM) doesn't need it anyway. So: on GPT without a BIOS-boot
+  # partition, skip the BIOS install and make the UEFI install REQUIRED; everywhere else the BIOS
+  # install is required and UEFI is best-effort. At least one path must always succeed.
+  local pttype biosboot grub_cmds
+  pttype=$(blkid -p -o value -s PTTYPE "/dev/$disk" 2>/dev/null)
+  biosboot=$(lsblk -rno PARTTYPE "/dev/$disk" 2>/dev/null | grep -ci '21686148-6449-6e6f-744e-656564454649' || true)
+  if [ "$pttype" = "gpt" ] && [ "${biosboot:-0}" = 0 ]; then
+    log "clone-boot: GPT without BIOS-boot partition — UEFI-only install (BIOS path skipped)"
+    grub_cmds="grub-install --target=x86_64-efi --efi-directory=/boot --boot-directory=/boot --removable --recheck"
+  else
+    grub_cmds="grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/$disk
+    grub-install --target=x86_64-efi --efi-directory=/boot --boot-directory=/boot --removable --recheck \
+      || echo 'WARN: UEFI grub-install failed (BIOS path still installed)'"
+  fi
   chroot "$cl" /bin/bash -c "set -e
     mkinitcpio -P
-    grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/$disk
-    grub-install --target=x86_64-efi --efi-directory=/boot --boot-directory=/boot --removable --recheck \
-      || echo 'WARN: UEFI grub-install failed (BIOS path still installed)'
+    $grub_cmds
     grub-mkconfig -o /boot/grub/grub.cfg"
   crc=$?
   for d in run sys proc dev; do run umount -R "$cl/$d" 2>/dev/null || true; done
@@ -500,6 +528,7 @@ cmd_videos(){
 
 # ---- notes-push ----
 cmd_notes_push(){
+  notes_leg_enabled || { log "notes-push: not configured — skipping"; return 0; }
   log "notes-push: $NOTES_REPO"
   # guard: the decrypted (plaintext) vault dir must be gitignored — abort if any path under it
   # became tracked. NOTES_PLAINTEXT_DIR is repo-relative; unset = no vault in this notes repo.
@@ -593,6 +622,7 @@ GUARD
 
 # ---- pictures (restic backup + HF mirror) ----
 cmd_pictures(){
+  pictures_leg_enabled || { log "pictures: not configured — skipping"; return 0; }
   # Repo lives on the always-present internal LUKS SSD, NOT the external DR drive — so this runs
   # unattended with nothing plugged in.
   local_up || return 1
@@ -670,13 +700,13 @@ cmd_daily(){
   local dow; dow=$(date +%u)      # 1=Mon..7=Sun
   local rc=0
   log "===== daily start ====="
-  cmd_notes_push        || rc=1                       # network only
+  if notes_leg_enabled; then cmd_notes_push || rc=1; else log "daily: notes leg not configured — skipping"; fi
   # Each step below skips its own missing hardware. Do NOT gate this block on the external being
   # plugged in — that legacy gate silently skipped the INTERNAL clone and the Pictures offsite
   # (neither needs the external) whenever the travel drive was away.
   if [ "$dow" = 7 ]; then do_clone weekly || rc=1; else do_clone daily || rc=1; fi
   cmd_ext_snapshot      || rc=1
-  cmd_pictures          || rc=1
+  if pictures_leg_enabled; then cmd_pictures || rc=1; else log "daily: pictures leg not configured — skipping"; fi
   if [ "$rc" = 0 ]; then echo "$(ts) OK" > "$STATUS_FILE"; log "===== daily OK ====="
   else log "===== daily completed WITH ERRORS ====="; fi
   return "$rc"
