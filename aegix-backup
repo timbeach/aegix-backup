@@ -12,6 +12,13 @@ mkdir -p "$LOG_DIR"
 # Which legs are configured? Empty/unset config disables a leg cleanly (clone-only installs are
 # first-class: one drive slot + no offsite is a legitimate day-one setup).
 notes_leg_enabled(){ [ -n "${NOTES_REPO:-}" ]; }
+# Filesystem shapes. A clone MIRRORS its source: btrfs @/@home sources get btrfs targets (subvolume
+# snapshots, two-rsync); any other fs (e.g. a stock ext4-on-LUKS install) gets a same-fs target,
+# cloned from the LIVE filesystem in one rsync (-x) — no snapshot isolation exists on plain fses.
+src_fstype(){ findmnt -no FSTYPE / 2>/dev/null; }
+target_fstype(){ blkid -s TYPE -o value "/dev/mapper/$EXT_MAPPER" 2>/dev/null; }
+# after unlock; falls back to the mirror assumption (source fs) under --dry-run when nothing is open
+effective_target_fstype(){ local t; t=$(target_fstype); [ -n "$t" ] && echo "$t" || src_fstype; }
 pictures_leg_enabled(){ [ -n "${PICTURES_SRC:-}" ] && [ -n "${LOCAL_LUKS_UUID:-}" ]; }
 
 # Capture the config's EXT_* values (the removable/external drive) before anything mutates them:
@@ -161,17 +168,25 @@ ext_unlock(){
 }
 
 ext_mount(){
-  local dev="/dev/mapper/$EXT_MAPPER"
-  # flip @/@home rw (received_uuid from the original btrfs send leaves them ro)
-  run mkdir -p "$MNT_DST_TOP"; mountpoint -q "$MNT_DST_TOP" || run mount -o compress=lzo,ssd "$dev" "$MNT_DST_TOP"
-  run btrfs property set -f "$MNT_DST_TOP/$SRC_ROOT" ro false 2>/dev/null || true
-  run btrfs property set -f "$MNT_DST_TOP/$SRC_HOME" ro false 2>/dev/null || true
-  # clone mounts
-  run mkdir -p "$MNT_CLONE"
-  mountpoint -q "$MNT_CLONE"      || run mount -o "compress=lzo,ssd,subvol=$SRC_ROOT" "$dev" "$MNT_CLONE"
-  run mkdir -p "$MNT_CLONE/home" "$MNT_CLONE/boot"
-  mountpoint -q "$MNT_CLONE/home" || run mount -o "compress=lzo,ssd,subvol=$SRC_HOME" "$dev" "$MNT_CLONE/home"
-  mountpoint -q "$MNT_CLONE/boot"  || run mount "/dev/disk/by-uuid/$EXT_BOOT_UUID" "$MNT_CLONE/boot"
+  local dev="/dev/mapper/$EXT_MAPPER" tfs; tfs=$(effective_target_fstype)
+  if [ "$tfs" = btrfs ]; then
+    # flip @/@home rw (received_uuid from the original btrfs send leaves them ro)
+    run mkdir -p "$MNT_DST_TOP"; mountpoint -q "$MNT_DST_TOP" || run mount -o compress=lzo,ssd "$dev" "$MNT_DST_TOP"
+    run btrfs property set -f "$MNT_DST_TOP/$SRC_ROOT" ro false 2>/dev/null || true
+    run btrfs property set -f "$MNT_DST_TOP/$SRC_HOME" ro false 2>/dev/null || true
+    # clone mounts
+    run mkdir -p "$MNT_CLONE"
+    mountpoint -q "$MNT_CLONE"      || run mount -o "compress=lzo,ssd,subvol=$SRC_ROOT" "$dev" "$MNT_CLONE"
+    run mkdir -p "$MNT_CLONE/home" "$MNT_CLONE/boot"
+    mountpoint -q "$MNT_CLONE/home" || run mount -o "compress=lzo,ssd,subvol=$SRC_HOME" "$dev" "$MNT_CLONE/home"
+    mountpoint -q "$MNT_CLONE/boot"  || run mount "/dev/disk/by-uuid/$EXT_BOOT_UUID" "$MNT_CLONE/boot"
+  else
+    # plain-fs target (mirrors a non-btrfs source): one filesystem, no subvolumes
+    run mkdir -p "$MNT_CLONE"
+    mountpoint -q "$MNT_CLONE"      || run mount "$dev" "$MNT_CLONE"
+    run mkdir -p "$MNT_CLONE/boot"
+    mountpoint -q "$MNT_CLONE/boot" || run mount "/dev/disk/by-uuid/$EXT_BOOT_UUID" "$MNT_CLONE/boot"
+  fi
 }
 
 ext_close(){
@@ -229,12 +244,15 @@ cmd_automount_up(){
   if ! run cryptsetup luksOpen --key-file "$EXT_KEYFILE" "/dev/disk/by-uuid/$EXT_LUKS_UUID" "$EXT_MAPPER"; then
     notify "DR drive plugged in, but the keyfile can't unlock it — has 'luksAddKey' been run?"
     log "automount-up: keyfile did not unlock the drive (keyslot not added?)"; return 0; fi
-  local dev="/dev/mapper/$EXT_MAPPER"
+  local dev="/dev/mapper/$EXT_MAPPER" mopts="ro"
+  [ "$(target_fstype)" = btrfs ] && mopts="ro,subvol=$SRC_ROOT"
   run mkdir -p "$AUTOMOUNT_MNT"
-  if ! run mount -o "ro,subvol=$SRC_ROOT" "$dev" "$AUTOMOUNT_MNT"; then
+  if ! run mount -o "$mopts" "$dev" "$AUTOMOUNT_MNT"; then
     run cryptsetup luksClose "$EXT_MAPPER"; fail "automount-up: read-only mount failed"; return 1; fi
-  run mkdir -p "$AUTOMOUNT_MNT/home"
-  run mount -o "ro,subvol=$SRC_HOME" "$dev" "$AUTOMOUNT_MNT/home" 2>/dev/null || true
+  if [ "$(target_fstype)" = btrfs ]; then
+    run mkdir -p "$AUTOMOUNT_MNT/home"
+    run mount -o "ro,subvol=$SRC_HOME" "$dev" "$AUTOMOUNT_MNT/home" 2>/dev/null || true
+  fi
   run touch "$AUTOMOUNT_MARKER"
   log "automount-up: mounted read-only at $AUTOMOUNT_MNT"
   notify "DR backup drive mounted read-only at $AUTOMOUNT_MNT"
@@ -269,6 +287,23 @@ home_exclude_args(){
   local -a ex=( "${EXCLUDE_HOME_ALWAYS[@]}" "${EXCLUDE_HOME_SEPARATE[@]}" )
   [ "$1" = daily ] && ex+=( "${EXCLUDE_HOME_DAILY_EXTRA[@]}" )
   local e; for e in "${ex[@]}"; do printf -- '--exclude=%s\n' "$e"; done
+}
+
+# excludes for the single-rsync (plain-fs) clone path. Transfer root is "/" itself, so:
+#  - EXCLUDE_ROOT applies as-is EXCEPT "/home" (home lives on the same fs and must be cloned);
+#  - the EXCLUDE_HOME_* patterns are anchored at the @home root ("/*/X" == "/<user>/X"), so for a
+#    transfer rooted at "/" they gain a "/home" prefix; unanchored patterns pass through.
+flat_exclude_args(){  # $1 = daily|weekly
+  local e
+  for e in "${EXCLUDE_ROOT[@]}"; do [ "$e" = "/home" ] && continue; printf -- '--exclude=%s\n' "$e"; done
+  local -a hx=( "${EXCLUDE_HOME_ALWAYS[@]}" "${EXCLUDE_HOME_SEPARATE[@]}" )
+  [ "$1" = daily ] && hx+=( "${EXCLUDE_HOME_DAILY_EXTRA[@]}" )
+  for e in "${hx[@]}"; do
+    case "$e" in
+      /*) printf -- '--exclude=/home%s\n' "$e";;
+      *)  printf -- '--exclude=%s\n' "$e";;
+    esac
+  done
 }
 
 # rsync that DOESN'T swallow failures. 0 = clean; 23/24 = partial (some files skipped, e.g. the
@@ -342,12 +377,21 @@ make_clone_bootable(){
   if [ "$DRYRUN" = 1 ]; then echo "DRYRUN: rewrite $cl/etc/{fstab,crypttab,default/grub}; chroot mkinitcpio+grub-install /dev/$disk"; return 0; fi
   # fstab: clone-local UUIDs only (internal-only data drives intentionally omitted so an absent
   # internal disk can't stall the recovery boot).
-  cat > "$cl/etc/fstab" <<EOF
+  local tfs; tfs=$(effective_target_fstype)
+  if [ "$tfs" = btrfs ]; then
+    cat > "$cl/etc/fstab" <<EOF
 # DR clone fstab — generated by aegix-backup $(ts)
 UUID=$btrfs_uuid	/	btrfs	rw,relatime,compress=lzo,ssd,space_cache=v2,subvol=/@	0 0
 UUID=$btrfs_uuid	/home	btrfs	rw,relatime,compress=lzo,ssd,space_cache=v2,subvol=/@home	0 0
 UUID=$EXT_BOOT_UUID	/boot	vfat	rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro	0 2
 EOF
+  else
+    cat > "$cl/etc/fstab" <<EOF
+# DR clone fstab — generated by aegix-backup $(ts)
+UUID=$btrfs_uuid	/	$tfs	rw,relatime	0 1
+UUID=$EXT_BOOT_UUID	/boot	vfat	rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro	0 2
+EOF
+  fi
   # crypttab -> external LUKS + mapper
   printf '%s UUID=%s none luks\n' "$EXT_MAPPER" "$EXT_LUKS_UUID" > "$cl/etc/crypttab"
   # GRUB cmdline -> external LUKS + mapper (rewrite the source; grub-mkconfig regenerates below)
@@ -441,18 +485,37 @@ PRESET
 do_clone_one(){  # $1 = daily|weekly ; operates on the currently selected clone target
   require_exclude_config || return 1
   ext_unlock || return 1
-  mk_src_snapshots
-  ext_mount
-  local rc=0
-  local -a root_ex home_ex
-  mapfile -t root_ex < <(root_exclude_args)
-  mapfile -t home_ex < <(home_exclude_args "$1")
-  log "clone-$1[$CLONE_TARGET]: ROOT"
-  do_rsync -aHAX --delete --partial --info=progress2 \
-      "${root_ex[@]}" "$MNT_SRC_TOP/ab-snap-root/" "$MNT_CLONE/" || rc=1
-  log "clone-$1[$CLONE_TARGET]: HOME"
-  do_rsync -aHAX --delete --partial --info=progress2 \
-      "${home_ex[@]}" "$MNT_SRC_TOP/ab-snap-home/" "$MNT_CLONE/home/" || rc=1
+  local rc=0 sfs tfs
+  sfs=$(src_fstype); tfs=$(effective_target_fstype)
+  # A clone mirrors its source. Mixed layouts (btrfs source -> ext4 target or vice versa) would
+  # need untested fstab/grub/initramfs divergence — refuse rather than produce a maybe-bootable copy.
+  if [ "$DRYRUN" != 1 ] && [ -n "$(target_fstype)" ] && [ "$sfs" != "$tfs" ]; then
+    fail "clone-$1[$CLONE_TARGET]: source fs is $sfs but target is $tfs — reprovision the target as $sfs (a clone mirrors its source)"; return 1
+  fi
+  if [ "$sfs" = btrfs ]; then
+    mk_src_snapshots
+    ext_mount
+    local -a root_ex home_ex
+    mapfile -t root_ex < <(root_exclude_args)
+    mapfile -t home_ex < <(home_exclude_args "$1")
+    log "clone-$1[$CLONE_TARGET]: ROOT"
+    do_rsync -aHAX --delete --partial --info=progress2 \
+        "${root_ex[@]}" "$MNT_SRC_TOP/ab-snap-root/" "$MNT_CLONE/" || rc=1
+    log "clone-$1[$CLONE_TARGET]: HOME"
+    do_rsync -aHAX --delete --partial --info=progress2 \
+        "${home_ex[@]}" "$MNT_SRC_TOP/ab-snap-home/" "$MNT_CLONE/home/" || rc=1
+  else
+    # Plain-fs source (e.g. stock ext4-on-LUKS): no snapshot isolation exists, so clone the LIVE
+    # filesystem in one rsync. -x stays on the root filesystem — it is what keeps /proc, /sys,
+    # /dev, /run, tmpfs, other disks, AND any mounted gocryptfs plaintext out of the copy.
+    # Limitation: a separate /home PARTITION is not cloned (document; not the stock layout).
+    ext_mount
+    local -a flat_ex
+    mapfile -t flat_ex < <(flat_exclude_args "$1")
+    log "clone-$1[$CLONE_TARGET]: FULL (live $sfs source, single rsync)"
+    do_rsync -aHAX -x --delete --partial --info=progress2 \
+        "${flat_ex[@]}" / "$MNT_CLONE/" || rc=1
+  fi
   log "clone-$1[$CLONE_TARGET]: BOOT"
   do_rsync -aHAX --delete --partial /boot/ "$MNT_CLONE/boot/" || rc=1
   # the rsyncs just overwrote /etc + /boot with the internal's UUIDs — re-make the clone bootable
@@ -500,7 +563,10 @@ cmd_clone_weekly(){ do_clone weekly; }
 cmd_ext_snapshot(){
   select_external_default   # snapshots live on the REMOVABLE drive, never an internal target
   ext_present || { log "ext-snapshot: external not attached — skipping"; return 0; }
-  ext_unlock || return 1; ext_mount
+  ext_unlock || return 1
+  if [ "$(effective_target_fstype)" != btrfs ]; then
+    log "ext-snapshot: target is not btrfs — no snapshot support, skipping"; return 0; fi
+  ext_mount
   local d; d=$(date '+%Y-%m-%d'); local sd="$MNT_DST_TOP/$EXT_SNAP_DIR"
   run mkdir -p "$sd"
   for sv in "$SRC_ROOT" "$SRC_HOME"; do
@@ -677,10 +743,13 @@ cmd_clone_browse(){
   local m="$BROWSE_BASE/$t"
   ext_unlock || return 1
   run mkdir -p "$m"
-  mountpoint -q "$m" || run mount -o "ro,subvol=$SRC_ROOT" "/dev/mapper/$EXT_MAPPER" "$m" || {
+  local mopts="ro"; [ "$(target_fstype)" = btrfs ] && mopts="ro,subvol=$SRC_ROOT"
+  mountpoint -q "$m" || run mount -o "$mopts" "/dev/mapper/$EXT_MAPPER" "$m" || {
     fail "clone-browse[$t]: read-only mount failed"; return 1; }
-  run mkdir -p "$m/home"
-  mountpoint -q "$m/home" || run mount -o "ro,subvol=$SRC_HOME" "/dev/mapper/$EXT_MAPPER" "$m/home" 2>/dev/null || true
+  if [ "$(target_fstype)" = btrfs ]; then
+    run mkdir -p "$m/home"
+    mountpoint -q "$m/home" || run mount -o "ro,subvol=$SRC_HOME" "/dev/mapper/$EXT_MAPPER" "$m/home" 2>/dev/null || true
+  fi
   log "clone-browse[$t]: mounted READ-ONLY at $m  (release with: aegix-backup clone-unbrowse $t)"
 }
 cmd_clone_unbrowse(){

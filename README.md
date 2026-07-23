@@ -51,7 +51,9 @@ You will also need, per clone target: a partitioned disk (legacy firmware: MBR w
 boot-flagged FAT32 + LUKS2→btrfs `@`/`@home`; UEFI-only firmware such as Framework laptops: GPT
 with a 1 MB BIOS-boot partition + ~1 GB ESP + LUKS2 — the tool detects the table type and installs
 the right GRUB paths), a keyfile keyslot (for unattended runs) and a passphrase keyslot (to unlock
-at boot). `RECOVERY.md` §3 walks through provisioning a fresh target.
+at boot). Provision the target with the **same filesystem as your source** — btrfs `@`/`@home`
+sources clone via read-only snapshots; plain ext4-on-LUKS sources clone live in a single `-x`
+rsync (mixed source/target layouts are refused). `RECOVERY.md` §3 walks through provisioning.
 
 The notes and pictures/offsite legs are **optional** — leave `NOTES_REPO` / the restic block
 unset for a clone-only install (e.g. a one-drive-slot laptop with an external clone target).

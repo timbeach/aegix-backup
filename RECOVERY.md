@@ -69,6 +69,10 @@ Do this from a running system (your recovered clone is fine).
      Note: some firmware won't even offer UEFI boot from an MBR disk, so GPT is the safe
      default for a drive that must boot anywhere. The tool auto-detects the table type and
      installs the right GRUB path(s).
+   - **Filesystem: mirror your source.** btrfs `@`/`@home` source → btrfs target (snapshot-based
+     clone). Plain ext4-on-LUKS source (some stock installs) → **ext4 target** (live single-rsync
+     clone; `-x` keeps other filesystems and mounted plaintext vaults out). The tool refuses
+     mixed layouts. Limitation: a separate `/home` partition is not cloned on the plain-fs path.
 3. Add a **keyfile** keyslot (for unattended backups) *and* a **passphrase** keyslot (you need this
    to unlock at boot; a keyfile-only volume cannot be unlocked at the initramfs prompt).
 4. Add it to `CLONE_TARGETS` in the config with its own `TGT_<name>_*` UUIDs.
