@@ -301,7 +301,11 @@ flat_exclude_args(){  # $1 = daily|weekly
   for e in "${hx[@]}"; do
     case "$e" in
       /*) printf -- '--exclude=/home%s\n' "$e";;
-      *)  printf -- '--exclude=%s\n' "$e";;
+      # Unanchored patterns (node_modules, target) meant "junk anywhere in a HOME". In a transfer
+      # rooted at "/" an unanchored pattern matches ANYWHERE — the first foreign-machine install
+      # excluded the kernel's /lib/modules/*/drivers/target/ directories and broke the fallback
+      # initramfs build. Scope them under /home/** instead.
+      *)  printf -- '--exclude=/home/**/%s\n' "$e";;
     esac
   done
 }
