@@ -187,6 +187,14 @@ ext_mount(){
     run mkdir -p "$MNT_CLONE/boot"
     mountpoint -q "$MNT_CLONE/boot" || run mount "/dev/disk/by-uuid/$EXT_BOOT_UUID" "$MNT_CLONE/boot"
   fi
+  # The boot mount MUST have taken: this tool runs without set -e, and an unnoticed mount failure
+  # silently redirects the /boot rsync + grub-install onto the clone's ROOT filesystem under the
+  # empty mountpoint (observed on the first foreign-machine install: a stale by-uuid race left the
+  # ESP unmounted and run 1 spilled /boot onto the root fs). Refuse rather than write to the wrong place.
+  if [ "$DRYRUN" != 1 ]; then
+    mountpoint -q "$MNT_CLONE" || { fail "ext_mount: $MNT_CLONE did not mount"; return 1; }
+    mountpoint -q "$MNT_CLONE/boot" || { fail "ext_mount: boot partition (UUID=$EXT_BOOT_UUID) did not mount at $MNT_CLONE/boot"; return 1; }
+  fi
 }
 
 ext_close(){
@@ -498,7 +506,7 @@ do_clone_one(){  # $1 = daily|weekly ; operates on the currently selected clone 
   fi
   if [ "$sfs" = btrfs ]; then
     mk_src_snapshots
-    ext_mount
+    ext_mount || return 1
     local -a root_ex home_ex
     mapfile -t root_ex < <(root_exclude_args)
     mapfile -t home_ex < <(home_exclude_args "$1")
@@ -513,7 +521,7 @@ do_clone_one(){  # $1 = daily|weekly ; operates on the currently selected clone 
     # filesystem in one rsync. -x stays on the root filesystem — it is what keeps /proc, /sys,
     # /dev, /run, tmpfs, other disks, AND any mounted gocryptfs plaintext out of the copy.
     # Limitation: a separate /home PARTITION is not cloned (document; not the stock layout).
-    ext_mount
+    ext_mount || return 1
     local -a flat_ex
     mapfile -t flat_ex < <(flat_exclude_args "$1")
     log "clone-$1[$CLONE_TARGET]: FULL (live $sfs source, single rsync)"
@@ -554,7 +562,7 @@ cmd_clone_bootfix(){
     if target_is_running_system; then
       log "clone-bootfix[$t]: target is the RUNNING system — skipping"; continue; fi
     ext_unlock || { rc=1; continue; }
-    ext_mount
+    ext_mount || { rc=1; ext_close; continue; }
     make_clone_bootable || rc=1
     ext_close
   done
@@ -570,7 +578,7 @@ cmd_ext_snapshot(){
   ext_unlock || return 1
   if [ "$(effective_target_fstype)" != btrfs ]; then
     log "ext-snapshot: target is not btrfs — no snapshot support, skipping"; return 0; fi
-  ext_mount
+  ext_mount || return 1
   local d; d=$(date '+%Y-%m-%d'); local sd="$MNT_DST_TOP/$EXT_SNAP_DIR"
   run mkdir -p "$sd"
   for sv in "$SRC_ROOT" "$SRC_HOME"; do
