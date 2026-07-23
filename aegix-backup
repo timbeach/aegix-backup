@@ -9,6 +9,18 @@ DRYRUN=0
 # shellcheck disable=SC1090
 . "$CONF"
 mkdir -p "$LOG_DIR"
+# Capture the config's EXT_* values (the removable/external drive) before anything mutates them:
+# select_clone_target() rebinds these globals per-target, so after a multi-target clone they point
+# at whichever target ran LAST. Anything that means "the external drive specifically" (ext-snapshot,
+# the automount plumbing) must restore these first instead of trusting array order.
+EXT_LUKS_UUID_DFL="${EXT_LUKS_UUID:-}"; EXT_BOOT_UUID_DFL="${EXT_BOOT_UUID:-}"
+EXT_MAPPER_DFL="${EXT_MAPPER:-}";       EXT_KEYFILE_DFL="${EXT_KEYFILE:-}"
+select_external_default(){
+  EXT_LUKS_UUID="$EXT_LUKS_UUID_DFL"; EXT_BOOT_UUID="$EXT_BOOT_UUID_DFL"
+  EXT_MAPPER="$EXT_MAPPER_DFL";       EXT_KEYFILE="$EXT_KEYFILE_DFL"
+  CLONE_TARGET="external"
+}
+
 # The config's SRC_LUKS names the mapper of the NORMAL system, but this tool has to work during an
 # actual recovery — i.e. when you have booted a CLONE and want to rebuild onto a replacement drive.
 # In that situation the configured mapper does not exist at all and every clone would fail at
@@ -458,6 +470,7 @@ cmd_clone_weekly(){ do_clone weekly; }
 
 # ---- external snapshots ----
 cmd_ext_snapshot(){
+  select_external_default   # snapshots live on the REMOVABLE drive, never an internal target
   ext_present || { log "ext-snapshot: external not attached — skipping"; return 0; }
   ext_unlock || return 1; ext_mount
   local d; d=$(date '+%Y-%m-%d'); local sd="$MNT_DST_TOP/$EXT_SNAP_DIR"
@@ -599,7 +612,9 @@ cmd_pictures(){
   # backup as the user. restic exit 3 == snapshot saved but at least one source file was unreadable
   # (e.g. the known-corrupt media on the worn NVMe) — that is a WARNING, not a failure, so we must
   # NOT bail (bailing here would skip the HF upload). Anything other than 0/3 is fatal.
-  restic_u -r "$repo" backup "$PICTURES_SRC" --tag aegix-auto; local rc=$?
+  # RESTIC_EXTRA_SRCS: optional additional paths (e.g. an encrypted-vault cipherdir) that ride in
+  # the same repo/snapshot — this is what gives them an OFFSITE leg via the HF mirror.
+  restic_u -r "$repo" backup "$PICTURES_SRC" ${RESTIC_EXTRA_SRCS[@]+"${RESTIC_EXTRA_SRCS[@]}"} --tag aegix-auto; local rc=$?
   case "$rc" in
     0) ;;
     3) log "pictures: restic backup completed with warnings (exit 3 — some source files unreadable, e.g. known-corrupt media); snapshot saved";;
@@ -656,13 +671,12 @@ cmd_daily(){
   local rc=0
   log "===== daily start ====="
   cmd_notes_push        || rc=1                       # network only
-  if ext_present; then
-    if [ "$dow" = 7 ]; then do_clone weekly || rc=1; else do_clone daily || rc=1; fi
-    cmd_ext_snapshot    || rc=1
-    cmd_pictures        || rc=1
-  else
-    log "daily: external not attached — clone/snapshot/pictures skipped"
-  fi
+  # Each step below skips its own missing hardware. Do NOT gate this block on the external being
+  # plugged in — that legacy gate silently skipped the INTERNAL clone and the Pictures offsite
+  # (neither needs the external) whenever the travel drive was away.
+  if [ "$dow" = 7 ]; then do_clone weekly || rc=1; else do_clone daily || rc=1; fi
+  cmd_ext_snapshot      || rc=1
+  cmd_pictures          || rc=1
   if [ "$rc" = 0 ]; then echo "$(ts) OK" > "$STATUS_FILE"; log "===== daily OK ====="
   else log "===== daily completed WITH ERRORS ====="; fi
   return "$rc"

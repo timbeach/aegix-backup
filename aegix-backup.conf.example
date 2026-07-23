@@ -94,6 +94,9 @@ PICTURES_SRC=/home/<youruser>/Pictures
 RESTIC_PW_FILE=/home/<youruser>/.config/aegix-backup/restic.key
 HF_PICTURES_REPO=<hf-user>/pictures-restic
 RESTIC_KEEP=( --keep-daily 7 --keep-weekly 8 --keep-monthly 12 )
+# Optional extra paths backed up into the same restic repo/snapshots (e.g. an encrypted-vault
+# cipherdir that is otherwise weekly-clone-only) — this is what gives them an OFFSITE leg:
+RESTIC_EXTRA_SRCS=( )
 # Guard files (README.md + AGENTS.md) are (re)generated inside the repo on every sync so other
 # humans/agents sharing the HF account know NOT to delete/prune this backup. Owner + optional note:
 HF_GUARD_OWNER="<Your Name>"
