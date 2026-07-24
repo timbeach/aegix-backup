@@ -56,6 +56,7 @@ restic_u(){ runuser -u "$AB_USER" -- env PATH="$USER_PATH" RESTIC_PASSWORD_FILE=
 usage(){ cat <<EOF
 aegix-backup <command>
   preflight     check prerequisites and config sanity
+  status        how did the last nightly go? (result + per-leg summary)
   clone-daily | clone-weekly | videos
   clone-bootfix [target]   re-apply bootability to one/all clone targets (no rsync)
   clone-browse <target> | clone-unbrowse <target>   read-only look inside a clone
@@ -793,6 +794,17 @@ cmd_daily(){
   return "$rc"
 }
 
+# ---- status: one-glance answer to "how did last night go?" ----
+cmd_status(){
+  echo "last result:  $(cat "$STATUS_FILE" 2>/dev/null || echo '(no run recorded yet)')"
+  local logf="$LOG_DIR/aegix-backup.log"
+  [ -r "$logf" ] || { echo "(log $logf not readable — try sudo)"; return 0; }
+  echo "last nightly:"
+  awk '/===== daily start/{buf=""} {buf=buf $0 "\n"} /===== daily (OK|completed)/{last=buf} END{printf "%s", last}' "$logf" \
+    | grep -aE "=====|clone-daily\[|clone-boot: clone|clone-boot: portable|pictures: done|notes-push: done|not configured|not attached|skipping|ERROR" \
+    | sed "s/^/  /"
+}
+
 # ---- dispatch ----
 case "${1:-}" in
   --dry-run) DRYRUN=1; shift;;
@@ -816,5 +828,6 @@ case "${1:-}" in
     # No ext_close trap: the restic disk is the permanent repo home and must stay mounted.
     cmd_local_up;;
   preflight) cmd_preflight;;
+  status) cmd_status;;
   *) usage; exit 1;;
 esac
