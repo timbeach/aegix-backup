@@ -1,0 +1,150 @@
+.TH AEGIX-BACKUP 8 "2026-07-24" "aegix-backup" "System Administration"
+.SH NAME
+aegix\-backup \- encrypted, tested\-restore disaster recovery for Aegix/Artix Linux (runit)
+.SH SYNOPSIS
+.B aegix\-backup
+.RI [ \-\-dry\-run ]
+.I command
+.RI [ target ]
+.SH DESCRIPTION
+.B aegix\-backup
+maintains a three\-legged, fully encrypted disaster\-recovery setup from one
+config file and one nightly cron entry:
+.IP \(bu 2
+.B Bootable clones
+\(em complete, independently bootable copies of the running system on an
+internal second disk and/or an external drive (LUKS2). After every sync the
+clone's boot chain (fstab, crypttab, GRUB for both BIOS and UEFI, plus a
+portable fallback initramfs) is repointed at the clone's own UUIDs and
+verified, so bootability is re\-earned nightly rather than assumed.
+.IP \(bu 2
+.B Encrypted offsite
+\(em a restic repository on an always\-present internal LUKS disk, mirrored to
+a private Hugging Face dataset repo. Only ciphertext ever leaves the machine.
+Optional.
+.IP \(bu 2
+.B Notes to a git remote.
+Optional.
+.PP
+A clone
+.B mirrors its source
+: btrfs @/@home systems clone via read\-only subvolume snapshots; plain
+filesystems (e.g. stock ext4\-on\-LUKS) clone live in a single
+.BR rsync (1)
+run with
+.BR \-x .
+Mixed source/target layouts are refused. Clone targets that are not attached
+are skipped, not errors, so the nightly succeeds whether or not a travel drive
+is plugged in.
+.PP
+The guiding principle:
+.B a backup you have not booted is a hypothesis, not a backup.
+Boot your clone once, on purpose, while the original still works.
+.SH COMMANDS
+.TP
+.B preflight
+Check binaries, config sanity and per\-leg prerequisites. Legs that are not
+configured are skipped, not failed.
+.TP
+.B status
+One\-glance answer to \(lqhow did the last nightly go?\(rq: the last recorded
+result plus the per\-leg summary of the most recent completed daily run.
+.TP
+.BR clone\-daily ", " clone\-weekly
+Clone the running system to every configured target and make each bootable.
+.B clone\-weekly
+applies fewer excludes (see
+.BR EXCLUDE_HOME_DAILY_EXTRA ).
+.TP
+.BI clone\-bootfix " \fR[\fPtarget\fR]\fP"
+Re\-apply bootability (fstab/crypttab/GRUB/initramfs) to one or all targets
+without an rsync.
+.TP
+.BI clone\-browse " target\fR,\fP " clone\-unbrowse " target"
+Mount a clone read\-only under
+.I /mnt/aegix\-browse/<target>
+for inspection, and release it. Internal targets are deliberately never
+auto\-mounted.
+.TP
+.B videos
+Add\-only top\-up of the Videos directory to the external drive.
+.TP
+.B pictures
+restic backup of the configured sources into the local repo, retention prune,
+then mirror the (ciphertext) repo to the Hugging Face remote, regenerating
+DO\-NOT\-DELETE guard files.
+.TP
+.B notes\-push
+Commit and push the notes repository. Refuses to push if anything under the
+configured plaintext\-vault directory has become tracked.
+.TP
+.B ext\-snapshot
+Dated btrfs snapshots of the external clone with retention (btrfs targets
+only).
+.TP
+.BR daily ", " now
+The nightly set: notes, clones (weekly variant on Sundays), external
+snapshot, pictures. Installed as
+.IR /etc/cron.daily/aegix\-backup ;
+anacron catches up missed days.
+.TP
+.BR automount\-up ", " automount\-down ", " automount\-sync
+Used by the udev/runit plumbing: plugging the external drive in mounts it
+read\-only at the configured browse mountpoint; unplugging cleans up.
+.TP
+.B local\-up
+Unlock and mount the internal restic disk (run at boot by a runit one\-shot;
+crypttab is not processed on Artix/runit).
+.TP
+.B \-\-dry\-run
+Prefix: print the actions a command would take without performing them.
+.SH CONFIGURATION
+All behaviour is driven by
+.IR /etc/aegix\-backup.conf
+(root\-only, mode 0600). Start from
+.I aegix\-backup.conf.example
+in the repository \(em every hard\-won lesson is documented next to the knob it
+protects. Identify disks by
+.B UUID, model or serial, never by device name
+.RI ( /dev/nvme0n1
+vs
+.IR /dev/nvme1n1
+is not stable across reboots). The notes and pictures/offsite legs are
+optional: leave their variables unset for a clone\-only install.
+.SH FILES
+.TP
+.I /etc/aegix\-backup.conf
+Configuration.
+.TP
+.I /etc/cron.daily/aegix\-backup
+Nightly entry (via cronie + anacron).
+.TP
+.I /etc/cryptsetup\-keys.d/*.key
+Keyfiles for unattended unlocks. Each clone target also needs a passphrase
+keyslot \(em a keyfile on the dead machine's encrypted root helps nobody.
+.TP
+.I /var/log/aegix\-backup/aegix\-backup.log
+Log.
+.TP
+.I RECOVERY.md
+The recovery runbook. Read it now, not during the disaster, and keep a copy
+somewhere that is not the machine being recovered.
+.SH EXAMPLES
+.nf
+sudo aegix\-backup preflight
+sudo aegix\-backup \-\-dry\-run daily
+sudo aegix\-backup clone\-daily
+sudo aegix\-backup status
+sudo aegix\-backup clone\-browse external
+.fi
+.SH SEE ALSO
+.BR cryptsetup (8),
+.BR rsync (1),
+.BR restic (1),
+.BR btrfs (8),
+.BR anacron (8)
+.PP
+Repository and documentation:
+.I https://github.com/timbeach/aegix\-backup
+.SH AUTHOR
+Timothy D Beach. MIT license.

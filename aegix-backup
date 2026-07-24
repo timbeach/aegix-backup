@@ -4,8 +4,33 @@ set -uo pipefail
 CONF=${AEGIX_BACKUP_CONF:-/etc/aegix-backup.conf}
 DRYRUN=0
 
+usage(){ cat <<EOF
+aegix-backup <command>
+  preflight     check prerequisites and config sanity
+  status        how did the last nightly go? (result + per-leg summary)
+  clone-daily | clone-weekly | videos
+  clone-bootfix [target]   re-apply bootability to one/all clone targets (no rsync)
+  clone-browse <target> | clone-unbrowse <target>   read-only look inside a clone
+  ext-snapshot
+  notes-push
+  pictures
+  daily | now   run the scheduled set (now == daily)
+  automount-up | automount-down | automount-sync   (udev/runit; interactive read-only browse mount)
+  local-up      unlock + mount the internal restic disk (runit boot service; keeps it mounted)
+  --dry-run     (prefix) show actions without doing them
+
+Config: /etc/aegix-backup.conf (see aegix-backup.conf.example). Most commands need root.
+Docs:   man aegix-backup · RECOVERY.md in the repo · https://github.com/timbeach/aegix-backup
+EOF
+}
+# help/usage must work without a config file and without root
+case "${1:-}" in
+  -h|--help|help) usage; exit 0;;
+  "") usage; exit 1;;
+esac
+
 # ---- load config ----
-[ -r "$CONF" ] || { echo "FATAL: missing config $CONF"; exit 1; }
+[ -r "$CONF" ] || { echo "FATAL: missing config $CONF (are you root? it is 0600)"; exit 1; }
 # shellcheck disable=SC1090
 . "$CONF"
 mkdir -p "$LOG_DIR"
@@ -53,22 +78,6 @@ as_user(){ runuser -u "$AB_USER" -- env PATH="$USER_PATH" "$@"; }
 # run restic as AB_USER with the repo password file wired in (DRY: init/backup/forget all use it)
 restic_u(){ runuser -u "$AB_USER" -- env PATH="$USER_PATH" RESTIC_PASSWORD_FILE="$RESTIC_PW_FILE" restic "$@"; }
 
-usage(){ cat <<EOF
-aegix-backup <command>
-  preflight     check prerequisites and config sanity
-  status        how did the last nightly go? (result + per-leg summary)
-  clone-daily | clone-weekly | videos
-  clone-bootfix [target]   re-apply bootability to one/all clone targets (no rsync)
-  clone-browse <target> | clone-unbrowse <target>   read-only look inside a clone
-  ext-snapshot
-  notes-push
-  pictures
-  daily | now   run the scheduled set (now == daily)
-  automount-up | automount-down | automount-sync   (udev/runit; interactive read-only browse mount)
-  local-up      unlock + mount the internal restic disk (runit boot service; keeps it mounted)
-  --dry-run     (prefix) show actions without doing them
-EOF
-}
 
 # ---- utilities ----
 ts(){ date '+%Y-%m-%d %H:%M:%S'; }

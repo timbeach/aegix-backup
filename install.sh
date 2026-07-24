@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 # ---- core tool + config ----
 install -Dm755 aegix-backup /usr/local/sbin/aegix-backup
+install -Dm644 aegix-backup.8 /usr/local/share/man/man8/aegix-backup.8
 install -Dm755 cron/aegix-backup.daily /etc/cron.daily/aegix-backup
 [ -e /etc/aegix-backup.conf ] || install -Dm600 aegix-backup.conf.example /etc/aegix-backup.conf
 mkdir -p /var/log/aegix-backup
